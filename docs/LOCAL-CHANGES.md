@@ -102,3 +102,13 @@ CREATE 定义里加白名单 + 末尾幂等 ALTER（兼容已有库）。
                            判定顺序改为「绝对禁止 → 内网硬禁 → scope 匹配」
 - `agent/http_probe.go`    +22 行：插三条策略闸（写方法 / 读取配额 / 速率）
 - `agent/scope_tool.go`    返回 `policy_usage` 用量快照
+
+### V8 —— `server/mcp_action_gate.go`（120 行）+ 测试（118 行，新增）
+
+MCP 动作类工具黑名单。V6/V7 只管 `http_probe`，而 agent 手上的
+`create_scan_task` 等工具能让 ScopeSentry（scan worker 跑 host 网络）去真扫描 ——
+那条路绕过了全部闸。
+
+修改：
+- `server/assembly.go`（+9 行）在 MCP 工具展开循环里过滤，不进 extra / 不进 unlock
+- 放开方式：`ARTEX_MCP_ALLOW_ACTIONS`（1 / all / `ScopeSentry:create_scan_task`）

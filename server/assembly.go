@@ -94,7 +94,16 @@ func wireAgentAugment(pg *db.DB, skillDir string, hostTools func() ([]actool.Cor
 					log.Printf("[mcp] %s tools/list 失败: %v", m.Name, err)
 					continue
 				}
+				// ★ MCP 动作类工具闸（本地新增 2026-10-17，见 mcp_action_gate.go）：
+				// 动作类工具会让【别的系统】去真发包（ScopeSentry 的 scan worker 跑 host 网络），
+				// V6/V7 的闸覆盖不到。默认拦下，由部署方用 ARTEX_MCP_ALLOW_ACTIONS 显式放开。
+				// 拦在展开之前：不进 extra ⇒ 模型看不见；不进 unlock ⇒ 知名字也调不了。
+				allowAction := mcpActionGate()
 				for _, t := range ts {
+					if !allowAction(m.Name, t.Name()) {
+						log.Printf("[mcp] %s.%s 属动作类工具，默认不授予 agent（ARTEX_MCP_ALLOW_ACTIONS 可放开）", m.Name, t.Name())
+						continue
+					}
 					extra = append(extra, t)
 					allNames = append(allNames, t.Name())
 					serverTools[m.Name] = append(serverTools[m.Name], t.Name())

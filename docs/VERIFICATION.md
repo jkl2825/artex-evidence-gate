@@ -201,7 +201,54 @@ observation 是在请求**之后**才写的，被拦的两次请求根本没有�
 ③ 规则⑥的速率闸是【保护性上限】，不是精确的 DDoS 防护；它防的是"无意跑飞"。
 ```
 
-### 3.9 上游能力的实测基线（用于对照，非本仓库改动）
+### 3.9 ★ V8 —— MCP 动作类工具闸（L2 + L3）
+
+**L2**：`go test ./server/ -run 'TestMCPActionGate|TestBareToolName'` **6 组全绿**——
+
+```
+默认拒绝      4 个动作类拦下 · 11 个查询类放行 · browser/fofa-relay 不误伤
+全放开        1/true/all/* 都生效
+精确放行      只放 ScopeSentry:create_scan_task，其余动作类仍拦
+大小写容错    空白与非大小写敏感
+全名回归      ★ 传 mcp__ScopeSentry__create_scan_task 也必须拦住（见下）
+剥前缀        4 例
+```
+
+**⚠ 这里踩了一个「静默失效」的坑，值得记：**
+
+```
+第一版黑名单用裸名 "create_scan_task" 比较。
+但 norma/mcp/mcp.go:21 的 ToolName() 把名字展开成 "mcp__"+server+"__"+name，
+mcp.go:210 的 wrap() 里 Name 用的正是全名。
+⇒ 循环里 t.Name() 拿到 "mcp__ScopeSentry__create_scan_task"
+⇒ 黑名单全部不匹配 ⇒ 不报错、不打日志、静默全放行。
+
+第一次 L3 验证时"日志里 0 条拦截"，我一开始以为是 MCP 没连上；
+查 mcp_tools_cache 的真实工具名才发现是命名不匹配。
+修法：加 bareToolName() 剥前缀，两种形式都接受。
+并补了一条 TestMCPActionGateFullName 把这次失败钉住。
+```
+
+**L3**：重建部署后建任务触发 assembly，容器日志原文：
+
+```
+[mcp] ScopeSentry.mcp__ScopeSentry__add_asset_tag         属动作类工具，默认不授予 agent（ARTEX_MCP_ALLOW_ACTIONS 可放开）
+[mcp] ScopeSentry.mcp__ScopeSentry__create_project        属动作类工具，默认不授予 agent（ARTEX_MCP_ALLOW_ACTIONS 可放开）
+[mcp] ScopeSentry.mcp__ScopeSentry__create_scan_task      属动作类工具，默认不授予 agent（ARTEX_MCP_ALLOW_ACTIONS 可放开）
+[mcp] ScopeSentry.mcp__ScopeSentry__create_scan_template  属动作类工具，默认不授予 agent（ARTEX_MCP_ALLOW_ACTIONS 可放开）
+```
+
+四条全部命中；同一时刻 `browser` MCP 正常挂载（说明只拦了动作类，没有误伤整体 MCP 连接）。
+
+**已知边界**：
+```
+① 只拦 ScopeSentry 的动作类工具。若将来接别的 ASM 平台（带扫描能力），
+   需要在 mcpActionTools 里补它的动作类工具名 —— 不补就是默认放行。
+② 不校验工具参数：如果放开了 create_scan_task，它的 targets 参数不受 V6 约束
+   （那把闸只认 http_probe 的 URL）。⇒ 放开时等于把范围责任交回给人。
+```
+
+### 3.10 上游能力的实测基线（用于对照，非本仓库改动）
 
 | 能力 | 结果 |
 |---|---|

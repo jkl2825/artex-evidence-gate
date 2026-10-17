@@ -25,6 +25,7 @@
 | V5 | 蜜罐指纹线索 | `agent/honeydetect.go` | `honeypot_check`：目标像不像已知开源蜜罐的默认配置（**线索级，非判定**） |
 | V6 | **授权范围闸** | `agent/scope_guard.go`<br>`agent/scope_tool.go` | `http_probe` 发请求**之前**先判目标是否在授权边界内；`scope_status` 看/声明边界。**绝对禁止段（云元数据/回环/链路本地/组播/保留）任何授权都不放行** |
 | V7 | **测试规则闸** | `agent/policy_guard.go` | 把四条通用测试规则落成硬判据：**①内网硬禁**（白名单例外）· **②越权读取 ≤5 组** · **⑤禁止写方法**（默认只读）· **⑥防 DDoS**（每分钟 + 单任务总量双闸） |
+| V8 | **MCP 动作类工具闸** | `server/mcp_action_gate.go` | agent 手上的 `create_scan_task` 等会【让别的系统去扫描】的工具默认不授予。ScopeSentry 的 scan worker 跑在 host 网络，V6/V7 的闸覆盖不到 ⇒ 这条补上那个缺口 |
 
 ### 为什么要有 V1–V2
 
@@ -98,6 +99,42 @@ V6 补的是最前面那一层，三道闸从硬到软：
   匿名遍历不属于越权（它仍受规则⑥的速率闸约束）。
 · 「写方法闸」的开关属于授权决策，不由模型自行打开 ——
   错误文案里明确写了这一点，且模型手边没有打开它的工具。
+```
+
+### V8 补的是 V6/V7 覆盖不到的那条路
+
+```
+V6（范围闸）/ V7（规则闸）只挂在 http_probe 上：
+  grep loadScopeGuard / checkMethod / checkReadQuota / checkBudget
+  → 只出现在 agent/http_probe.go
+
+但 agent 手边还有一组 MCP 工具能【让别的系统去扫描】：
+  mcp__ScopeSentry__create_scan_task / create_project / create_scan_template / add_asset_tag
+而 ScopeSentry 的 scan worker 容器跑在 network=host，直接对目标发包
+⇒ 这条路上 V6/V7 全部被绕过。
+```
+
+修法：在 MCP 工具展开时拦（`server/assembly.go` 的 `for _, t := range ts` 循环前）。
+不进 `extra` ⇒ 模型看不见；不进 `unlock` ⇒ 知道名字也调不了。
+
+```go
+// server/mcp_action_gate.go
+var mcpActionTools = map[string]map[string]bool{
+    "ScopeSentry": {
+        "create_project": true, "create_scan_task": true,
+        "create_scan_template": true, "add_asset_tag": true,
+    },
+}
+```
+
+用黑名单而不是白名单的理由：MCP 的工具集由对方决定、会随版本增减。
+白名单不全 → 新工具默认放行；黑名单不全 → 新工具默认被拦。
+对"动作类"这种可能造成外部影响的东西，默认拦下更安全。
+
+放开方式：
+```
+ARTEX_MCP_ALLOW_ACTIONS=1                              全部放开
+ARTEX_MCP_ALLOW_ACTIONS=ScopeSentry:create_scan_task   只放开指定的
 ```
 
 ### V5 的诚实边界（重要）
