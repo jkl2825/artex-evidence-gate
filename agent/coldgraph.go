@@ -92,9 +92,33 @@ func isLiveIntent(n cgNode) bool {
 	return false
 }
 
-// foldableKind reports whether a node kind is eligible for folding at all (§2:
-// only fact and settled intent; finding/goal/hint/begin/digest never fold).
-func foldableKind(k string) bool { return k == db.KindIntent || k == db.KindFact }
+// foldableKind reports whether a node kind is eligible for folding at all.
+//
+// ★ 2026-10-17 修正：原版只认 intent/fact，因为原版没有证据层节点。
+// 本 fork 加了 http_probe，每次探测写一条 observation（60 分钟 370+ 条），
+// 而它不在可折叠集合里 ⇒ 只增不减 ⇒ 探索链路图被 observation 淹没
+// （实测 466 节点里 373 条是 observation，digest 0 次触发）。
+//
+// 加上观察/审计/基线三类"记录型"节点后可折，但不会影响证据链：
+//
+//	· observation 通过 intent --yields--> observation 挂载，
+//	  所以【活意图的直接子节点保持热】（hotSet rule 1），
+//	  只有意图已经 settled 之后它的 observation 才会变冷、才折。
+//	· 判定与审计一律走 DB 直查（ListByKindForIntent），不走图 ⇒ 折叠不影响谓词。
+//	· cold-digest 本身存储无损、只压呈现，原始节点永久保留、按 id 可还原。
+//
+// 仍然【不可折】的：finding（真漏洞）、goal（目标）、hint（战略提示）、
+// begin（图根）、digest（已折叠块自身）、thread（当前主线，必须一直可见）。
+func foldableKind(k string) bool {
+	switch k {
+	case db.KindIntent, db.KindFact:
+		return true
+	// 证据/审计/基线：只用于支撑判定与追溯，不需要在图上一一展开
+	case kindObservation, kindValidityAudit, kindValidityGate, kindBaseline:
+		return true
+	}
+	return false
+}
 
 // hotSet computes the hot nodes (§2 rule 1+2): a node is hot iff it can reach a
 // live intent by going downstream (it is an ancestor of a live intent), OR it is
