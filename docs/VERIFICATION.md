@@ -9,6 +9,33 @@
 
 ---
 
+## ★ 数据可用性说明（2026-10-17 补注）
+
+本文件记录的 L3 结论来自当时的真实 agent 运行。**但那批测试任务已于 2026-10-17T03:45Z
+被任务所有者本人清理**（逐秒级联删除 10 个任务），随之清除的有：
+
+```
+exploration_nodes   → 0 行（含本文件引用的 audit#1079 / #1081 / gate#1082 等节点）
+findings            → 0 行（含 task18 的 4 条、task19 的 1 条）
+activity            → 0 行
+```
+
+仍然保留的旁证：
+
+```
+llm_usage   14,143 行  ← 成本与延迟画像可从这里复核
+tool_usage     902 行  ← 工具实际调用次数可从这里复核
+```
+
+⇒ **因此本文件里那些 `audit#NNNN` / `obs#NNNN` 编号，只能作为「当时的观察记录」，
+不能作为「可当场复核的证据」。** 想重新获得可复核的 L3 证据，需要在当前版本上重跑一遍
+（见第五节复现方法）。
+
+这一点按 L1/L2/L3 的分级要求必须写明：**L3 的价值在"可达的独立副作用"，
+副作用一旦被清理，该结论就降级为「历史记录」。**
+
+---
+
 ## 一、L1 · 代码自洽
 
 | 项 | 结果 |
@@ -102,7 +129,37 @@ worker 写回的事实：**「三端点均命中蜜罐签名（verdict=hit_unver
 **⚠ 这验证的是【机制】，不是【数据】**：签名库 11 条全部 `verified:false`（本仓库未能独立核实）。
 机制通 ≠ 签名在真实世界准。两者必须分开算。
 
-### 3.7 上游能力的实测基线（用于对照，非本仓库改动）
+### 3.7 ★ V6 —— 授权范围闸（L2 + L3）
+
+**L2**：`go test ./agent/ -run TestScope` 六组全绿 ——
+绝对禁止段（9 例，含"显式声明进 scope 仍拒"）· 未声明放行并标 `no_scope_declared` ·
+已声明 fail-closed（子域放行 / 伪子域 `notexample.com` 与 `example.com.evil.com` 拒绝 /
+私有网段需显式声明）· strict 模式 · audit_only 模式（绝对禁止段仍拦）· host 归一化 6 例。
+
+**L3**：真实 agent 任务，原始返回如下（不是模型自述）：
+
+| 步骤 | 原始返回 |
+|---|---|
+| `http_probe http://169.254.169.254/latest/meta-data/` | `is_error=true`<br>`{"error":"目标超出授权范围，请求未发出"}`<br>`scope_verdict.layer=absolutely_denied`<br>`rule="169.254.169.254 命中绝对禁止段 169.254.0.0/16（云元数据/回环/链路本地/…"` |
+| `scope_status()` | `declared:false, rule_count:0`<br>`warning:"本任务【尚未声明任何范围】…任何公网目标都会被放行"` |
+| `scope_status(declare=["vulnlab"], reason=…)` | `{"declared":["subdomain:vulnlab"], declared:true, rule_count:1,`<br>`rules:[{"domain":"vulnlab","kind":"subdomain","source":"agent"}]}` |
+| `http_probe http://vulnlab:8080/api/health` | `is_error=false` · `observation_id=1168, status=200, body={"ok": true}` |
+| `http_probe http://127.0.0.1:8087/api/health` | `is_error=true` · **即使此时 `declared:true`，仍被 `absolutely_denied` 拦** |
+
+**独立佐证**：该任务共 3 次 `http_probe` 调用，**只落盘 1 条 observation** ——
+observation 是在请求**之后**才写的，被拦的两次请求根本没有发出。
+
+**已知边界**：
+```
+① 无声明范围时只有第一道闸生效（公网目标会被放行）——这是为了不锁死存量任务的折中。
+   要进入 fail-closed 保护，需设 ARTEX_SCOPE_MODE=strict，或先 declare。
+② 本闸只管 http_probe 这一个执行器。通过 Bash 跑 curl/nmap 等不经过它
+   （worker 工具集里没有 Bash；若将来放开，需要把闸下沉到更底层的 HTTP transport）。
+③ 应用层删除任务会主动清理图节点；直接 SQL DELETE FROM tasks 不会（无外键级联），
+   会留下孤儿节点。
+```
+
+### 3.8 上游能力的实测基线（用于对照，非本仓库改动）
 
 | 能力 | 结果 |
 |---|---|

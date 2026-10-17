@@ -59,6 +59,13 @@ var BuiltinPredicates = []PredicateSpec{
 		AppliesWhen: "任何要判「没发现」的实验",
 		Requires: "一条证明本实验要验证的效果【可被当前上下文观察到】的对照观察引用。" +
 			"没有可见回显 ≠ 没有效果", Enforced: true},
+	{Name: "out_of_scope", Version: 1, Layer: "授权范围",
+		AppliesWhen: "任何实验（总是适用，且是前置条件）",
+		Requires: "一条指向【授权范围内目标】的结构化观察引用。" +
+			"目标落在绝对禁止段（云元数据 169.254/16、回环 127/8、链路本地、组播、保留段）时" +
+			"无论 scope 怎么写都不放行；私有网段需在 task_scope 中显式声明。" +
+			"★ 这一层判的是「你引用的证据，其目标在不在授权边界内」—— 超范围目标的观察不能支撑任何结论",
+		Enforced: true},
 	{Name: "method.applicable", Version: 1, Layer: "方法适用性",
 		AppliesWhen: "想让判定更完整时（可选）",
 		Requires: "方法与本目标条件相容的依据。" +
@@ -226,6 +233,24 @@ func (t *ToolSet) semanticCheck(evID int64, predicate string, cx expContext) (st
 		}
 		return "true", fmt.Sprintf("观察 %d：响应有可观察内容（%d bytes，HTTP %d）—— 观察渠道成立",
 			evID, o.RespLen, o.RespStatus)
+
+	case "out_of_scope":
+		if strings.TrimSpace(o.ActualURL) == "" && strings.TrimSpace(o.Target) == "" {
+			return "false", fmt.Sprintf("观察 %d 没有记录实际目标（actual_url / target 均空）—— "+
+				"无法判定授权范围。请用 http_probe 记录该观察，它会落盘实际目标", evID)
+		}
+		raw := strings.TrimSpace(o.ActualURL)
+		if raw == "" {
+			raw = strings.TrimSpace(o.Target)
+		}
+		g := t.loadScopeGuard()
+		v := g.checkURL(raw)
+		if v.Allowed {
+			return "true", fmt.Sprintf("观察 %d：目标 %s 在授权范围内（%s；%s）",
+				evID, v.Host, v.Layer, v.Rule)
+		}
+		return "false", fmt.Sprintf("观察 %d：目标 %s 【超出授权范围】—— %s。%s",
+			evID, v.Host, v.Layer, v.Rule)
 
 	case "method.applicable":
 		return "unknown", "方法适用性无法由单条观察判定 —— 上游明确「黑盒响应不能普遍证明到达了特定代码分支」，本层只报不拦"
@@ -615,6 +640,9 @@ func (t *ToolSet) auditValidity() actool.CoreTool {
 			required := map[string]bool{
 				"transport.reachable":   true,
 				"observation.available": true,
+				// ★ 授权范围是前置条件：超范围目标的观察不能支撑任何结论。
+				//   见 scope_guard.go。装在 required 里意味着"每份审计都要过这一层"。
+				"out_of_scope": true,
 			}
 			if a.NeedAuth != nil && *a.NeedAuth {
 				required["session.valid"] = true

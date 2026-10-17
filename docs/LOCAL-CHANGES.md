@@ -74,3 +74,16 @@ CREATE 定义里加白名单 + 末尾幂等 ALTER（兼容已有库）。
 ### 修改 —— `.dockerignore`（+5 / -0）
 
 排除工具链目录作双保险（防止有人忘记传 `--build-context` 时白拷 500MB）。
+
+### V6 —— `agent/scope_guard.go`（655 行）+ `agent/scope_tool.go`（118 行）+ `scope_guard_test.go`（197 行，新增）
+
+授权范围闸。`http_probe` 在发请求**之前**与**每一跳重定向**都过闸；
+`scope_status` 工具让 worker 能看见边界并显式声明。
+
+三道闸（绝对禁止段无例外 / 私有网段需声明 / 声明外 fail-closed）、
+只认 `source ∈ {manual,agent}`、DNS 只用于 deny 防 rebinding、DNS 结果 60 秒缓存。
+
+修改：
+- `agent/http_probe.go`（+24）发请求前 + `CheckRedirect` 内各插一道闸
+- `agent/predicate.go`（+28）新增第 6 个谓词 `out_of_scope`（`Enforced: true`，进 `required`）
+- `agent/tools_insert.go`（+8）接线 `scopeStatus()`

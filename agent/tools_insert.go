@@ -674,6 +674,9 @@ func (t *ToolSet) WorkerTools() []actool.CoreTool {
 		// 但它【只是线索不是判定】：签名库来自第三方、本机未独立核实、只覆盖开源默认配置。
 		// 故不接入写回门的强制判定（阈值未实测校准）。
 		t.honeypotCheck(),
+		// ★ scope_status（本地新增 2026-10-17）：看/声明本任务的授权边界。
+		// http_probe 会在发请求前过 scope guard；被拦时用本工具声明，不要绕。
+		t.scopeStatus(),
 		// 以下工具仍【不给】worker，只留给 planner/main（读上下文、跨 work 复盘是规划职责，
 		// worker 只做单条意图的执行与写回）：list_facts / list_companies / list_worker_traces。
 	}

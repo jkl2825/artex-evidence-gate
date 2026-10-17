@@ -269,6 +269,24 @@ func (t *ToolSet) httpProbe() actool.CoreTool {
 				method = "GET"
 			}
 
+			// ── ★ 授权范围闸（本地新增）：请求发出【之前】先问一句「这个 host 在授权边界内吗」──
+			// 三道闸见 scope_guard.go 文件头。绝对禁止段（云元数据/回环/链路本地/组播/保留）
+			// 无论 scope 怎么写都拦下；其余按声明判定。
+			guard := t.loadScopeGuard()
+			sv := guard.checkURL(a.URL)
+			if blocked, verdict := guard.enforce(sv); blocked {
+				body, _ := json.MarshalIndent(map[string]any{
+					"error":         "目标超出授权范围，请求未发出",
+					"scope_verdict": verdict,
+					"scope":         guard.summary(),
+					"next": "若该目标确在授权范围内：用 add_task_scope 显式加入" +
+						"（kind=ip/cidr/subdomain/root_domain，务必填 reason），或调用 " +
+						"scope_status(auto_declare=true) 从任务目标文本自动声明。" +
+						"绝对禁止段（169.254/16 云元数据、127/8 回环、组播、保留）任何情况下都不放行。",
+				}, "", "  ")
+				return actool.Errorf(string(body)), nil
+			}
+
 			// ── 实际发请求 ──
 			var bodyRd io.Reader
 			if a.Body != "" {
@@ -291,6 +309,12 @@ func (t *ToolSet) httpProbe() actool.CoreTool {
 				CheckRedirect: func(r *http.Request, via []*http.Request) error {
 					if len(via) >= 10 {
 						return fmt.Errorf("重定向次数过多")
+					}
+					// ★ 每一跳都过范围闸：SSRF 的常见手法就是 302 到云元数据端点，
+					// 只在发起时检查会被绕过。
+					if blocked, verdict := guard.enforce(guard.checkHost(r.URL.Hostname())); blocked {
+						return fmt.Errorf("重定向目标超出授权范围：%s（%s / %s）",
+							verdict.Host, verdict.Layer, verdict.Rule)
 					}
 					return nil
 				},
