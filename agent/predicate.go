@@ -202,6 +202,14 @@ func (t *ToolSet) semanticCheck(evID int64, predicate string, cx expContext) (st
 				"证明会话有效必须有匿名基线对照：先用 http_probe 发一次 actor=anonymous，再对同一 URL "+
 				"带凭据发一次，并在后者填 compare_with=<匿名观察 id>", evID, o.Actor)
 		}
+		// ★ 对照本身无效时不能算"可区分"。
+		// CompareSame 的零值是 false，若不在这里拦住，一个不存在的 compare_with
+		// 会被误读成"两条响应不同" ⇒ 给出假的 session.valid。
+		if o.CompareInvalid {
+			return "false", fmt.Sprintf("观察 %d 指定的对照 %d 不可用（不存在或不是 observation）—— "+
+				"本次不构成有效对照，会话有效性无法判定。请确认 compare_with 是真实的 observation 节点 id 后重发",
+				evID, o.CompareWith)
+		}
 		if o.CompareSame {
 			return "false", fmt.Sprintf("观察 %d 与对照 %d 【逐字节相同】—— 带凭据与不带凭据的响应完全一致，"+
 				"说明该凭据没有改变服务判定，会话有效性不成立", evID, o.CompareWith)
@@ -218,6 +226,12 @@ func (t *ToolSet) semanticCheck(evID int64, predicate string, cx expContext) (st
 			return "false", fmt.Sprintf("观察 %d 针对对象 %q 但无对照。上游明确："+
 				"「对象不存在与无权访问可能同为 404，只凭单一响应不能归因」——"+
 				"请再用另一个对象引用（含不存在的）发一次观察并填 compare_with", evID, o.Object)
+		}
+		// ★ 同 session.valid：对照失效不能被当作"可区分"。
+		if o.CompareInvalid {
+			return "false", fmt.Sprintf("观察 %d 指定的对照 %d 不可用（不存在或不是 observation）—— "+
+				"本次不构成有效对照，对象存在性无法判定。请确认 compare_with 是真实的 observation 节点 id 后重发",
+				evID, o.CompareWith)
 		}
 		if o.CompareSame {
 			return "false", fmt.Sprintf("观察 %d 与对照 %d 【逐字节相同】—— 两个不同对象引用得到完全相同的响应，"+
@@ -411,9 +425,18 @@ func (t *ToolSet) registerBaseline() actool.CoreTool {
 			}
 			// 基线是「已验证的对照」，因此它的证据必须是结构化观察（执行器记录的），
 			// 不能是模型自己写的 fact —— 否则基线本身就不可复核。
-			res, why := t.semanticCheck(a.EvidenceRef, "observation.available", expContext{})
+			// ★ 按 kind 选对应谓词：原实现一律只查 observation.available（最弱的一层），
+			// 于是一条普通响应就能登记成 session/object 基线，再被当作"已验证的对照"复用。
+			basePred := "observation.available"
+			switch strings.ToLower(strings.TrimSpace(a.Kind)) {
+			case "session":
+				basePred = "session.valid"
+			case "object":
+				basePred = "object.exists"
+			}
+			res, why := t.semanticCheck(a.EvidenceRef, basePred, expContext{})
 			if res != "true" {
-				return actool.Errorf(fmt.Sprintf("基线登记失败（证据必须是结构化观察）：%s", why)), nil
+				return actool.Errorf(fmt.Sprintf("基线登记失败（%s 这一层未通过，证据必须是结构化观察）：%s", basePred, why)), nil
 			}
 			pl := baselinePayload(a.Kind, a.Target, a.Actor, a.Object, a.Purpose,
 				a.EvidenceRef, a.TTLSeconds, a.InvalidIf)
@@ -692,6 +715,20 @@ func (t *ToolSet) auditValidity() actool.CoreTool {
 					res, why, srcRef := t.checkBaseline(c.BaselineID, cx)
 					lr.BaselineRef = c.BaselineID
 					lr.EvidenceRef = srcRef
+					if res == "true" {
+						// ★★★ 基线只是"把已验过的对照记下来复用"，它本身不是证据。
+						// 原实现只查 存在/未过期/上下文相容 就判 true，从不看源观察是否
+						// 真的满足本谓词的语义 —— 于是一条普通 HTTP 响应登记成基线后，
+						// 可以被 session.valid / object.exists / out_of_scope 随意复用。
+						// 修：采纳基线时，对它的源观察跑同一个 semanticCheck。
+						if srcRef <= 0 {
+							res = "false"
+							why = why + "；但基线未记录源观察引用，无法复核语义"
+						} else if sres, swhy := t.semanticCheck(srcRef, spec.Name, cx); sres != "true" {
+							res = "false"
+							why = why + "；且源观察未通过本谓词语义检查：" + swhy
+						}
+					}
 					if res == "true" {
 						lr.Result, lr.ViaBaseline = "true", true
 						lr.Reason = why + "；以基线复用代替重复诊断（上游 R05-V3）"

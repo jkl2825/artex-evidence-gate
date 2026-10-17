@@ -25,6 +25,7 @@ package agent
 // 规则③（禁止披露）、④（禁止保留）是人的行为，代码只能辅助脱敏与清理，不在此文件。
 
 import (
+	"encoding/json"
 	"fmt"
 	"net/url"
 	"os"
@@ -33,6 +34,8 @@ import (
 	"strings"
 	"sync"
 	"time"
+
+	actool "github.com/Autumn-27/norma/tool"
 )
 
 // ── 上限配置（全部走环境变量，带保守默认值）────────────────────────────────
@@ -140,6 +143,20 @@ func (t *ToolSet) checkMethod(method string) policyVerdict {
 
 // ── 规则⑥：速率与总量 ────────────────────────────────────────────────────
 
+// denyRequest 构造一条策略拒绝结果。
+// 抽出来是为了让 http_probe 的顺序判定只需三行，且拒绝文案只有一处。
+func (t *ToolSet) denyRequest(pv policyVerdict) actool.Result {
+	body, _ := json.MarshalIndent(map[string]any{
+		"error":  "违反测试规则，请求未发出",
+		"policy": pv,
+		"usage":  t.policySnapshot(),
+		"next": "这条是部署方设定的硬约束，不是建议。请调整测试方式（改用只读方法 / " +
+			"减少读取组数 / 降低频率），而不是绕过本执行器。" +
+			"确需放宽时，由部署方调整对应的 ARTEX_POLICY_* 环境变量。",
+	}, "", "  ")
+	return actool.Errorf(string(body))
+}
+
 // checkBudget 判本次请求是否在上限内。通过时【已计入】。
 func (t *ToolSet) checkBudget() policyVerdict {
 	maxTotal, maxPerMinute, _, _ := policyLimits()
@@ -184,10 +201,10 @@ func (t *ToolSet) checkBudget() policyVerdict {
 //
 //	GET /api/user?id=1   → key="h|/api/user"  val="id=1"
 //	GET /api/user/2      → key="h|/api/user"  val="#2"     （路径末段当对象）
-func readQuotaKey(rawURL string) (key, val string) {
+func readQuotaKey(rawURL string) (key, val string, objectLike bool) {
 	u, err := url.Parse(rawURL)
 	if err != nil || u.Host == "" {
-		return "", ""
+		return "", "", false
 	}
 	host := strings.ToLower(u.Hostname())
 	path := u.Path
@@ -203,27 +220,58 @@ func readQuotaKey(rawURL string) (key, val string) {
 		}
 		sort.Strings(names)
 		var b strings.Builder
+		allObjectLike := true
 		for _, k := range names {
 			v := vals.Get(k)
-			// 只保留值的形状提示，不把完整值落进日志
+			// ★ 逐【值】判断是不是测试载荷（不要判整个 "k=v&k=v" 组合串 —— 它自带 '=' 会被误判）
+			if !looksLikeObjectValue(v) {
+				allObjectLike = false
+			}
 			b.WriteString(k)
 			b.WriteString("=")
 			b.WriteString(v)
 			b.WriteString("&")
 		}
-		return host + "|" + path, strings.TrimSuffix(b.String(), "&")
+		return host + "|" + path, strings.TrimSuffix(b.String(), "&"), allObjectLike
 	}
 	// 无 query：把路径末段当对象标识
 	segs := strings.Split(strings.Trim(path, "/"), "/")
 	if len(segs) >= 2 {
 		last := segs[len(segs)-1]
 		prefix := "/" + strings.Join(segs[:len(segs)-1], "/")
-		// 末段像 ID（纯数字 / 短 token）才当对象
-		if len(last) > 0 && len(last) <= 40 {
-			return host + "|" + prefix, "#" + last
+		// 末段像 ID（纯数字 / 短 token、且不含载荷特征）才当对象
+		if looksLikeObjectValue(last) {
+			return host + "|" + prefix, "#" + last, true
+		}
+		// 末段是载荷（/api/user/1'/...）⇒ 不是对象遍历
+		return host + "|" + path, path, false
+	}
+	return host + "|" + path, path, true
+}
+
+// looksLikeObjectValue 判断一个 query 值像不像"对象标识"（而不是测试 payload）。
+//
+// ★ 为什么要区分（2026-10-17 修）：原实现把「同一接口的 query 值组合」直接当成
+// 「不同的数据组」计数。这会把 SQL 注入 / XSS / 命令注入的**载荷变体**也算成"读了新对象"：
+//
+//	/api/user?id=1          → id=1         （读了一个对象，应计数）
+//	/api/user?id=1' OR '1'='1 → 载荷，不该算"又读了一个对象"
+//
+// 规则②的原意是「越权漏洞禁止批量读取，允许读取的数据不超过 N 组」——
+// 约束的是【批量拉取别人的数据】，不是约束注入测试。误把载荷计进去，会让正常的
+// 参数变体测试在第 6 个 payload 就被卡住，直接压缩挖掘空间。
+func looksLikeObjectValue(v string) bool {
+	if v == "" || len(v) > 40 {
+		return false
+	}
+	// 含这些字符的值视为测试载荷：引号/括号/注释符/编码/路径/空白/模板符号
+	const poison = "\"'<>()%;|&=/\\`${}[]+*#@!~^,:? \t\n"
+	for _, c := range v {
+		if strings.ContainsRune(poison, c) {
+			return false
 		}
 	}
-	return host + "|" + path, path
+	return true
 }
 
 // checkReadQuota 判读取是否超配额。只在【携带身份】的请求上计数。
@@ -235,8 +283,13 @@ func (t *ToolSet) checkReadQuota(rawURL, actor string) policyVerdict {
 		return policyVerdict{Allowed: true, Rule: "ok"}
 	}
 	_, _, maxReads, _ := policyLimits()
-	key, val := readQuotaKey(rawURL)
+	key, val, objectLike := readQuotaKey(rawURL)
 	if key == "" || val == "" {
+		return policyVerdict{Allowed: true, Rule: "ok"}
+	}
+	// ★ 载荷变体不算"读取新对象"（见 looksLikeObjectValue 注释）。
+	// 由 readQuotaKey 逐值判定，避免把 "id=6" 自带的 '=' 当成载荷特征。
+	if !objectLike {
 		return policyVerdict{Allowed: true, Rule: "ok"}
 	}
 

@@ -91,7 +91,12 @@ type observationPayload struct {
 	At          string            `json:"at"` // 时间（RFC3339）
 	CompareWith int64             `json:"compare_with,omitempty"`
 	CompareSame bool              `json:"compare_identical,omitempty"` // 与对照是否逐字节相同
-	CompareNote string            `json:"compare_note,omitempty"`
+	// CompareInvalid 表示【对照本身不可用】（节点不存在 / 不是 observation / 属于别的任务）。
+	// ★ 为什么必须显式标记：CompareSame 的零值是 false，而 session.valid / object.exists
+	// 的判据是「CompareWith>0 且 !CompareSame」—— 对照失效时会被误读成「两条响应可区分」，
+	// 从而给出一个假的 true。加这个字段，让谓词层能明确判 false。
+	CompareInvalid bool   `json:"compare_invalid,omitempty"`
+	CompareNote    string `json:"compare_note,omitempty"`
 	Extracted   map[string]string `json:"extracted,omitempty"`  // 动态依赖提取结果
 	ModelNote   string            `json:"model_note,omitempty"` // 模型自述（仅供参考，非唯一来源）
 	Summary     string            `json:"summary"`
@@ -291,23 +296,18 @@ func (t *ToolSet) httpProbe() actool.CoreTool {
 			// 顺序与理由：范围 → 写方法 → 读取配额 → 速率。
 			// 范围最硬（连发都不该发）；写方法次之（改数据是规则⑤的红线）；
 			// 读取配额是规则②（越权批量读取 ≤5 组）；速率是规则⑥（防 DDOS）。
-			for _, pv := range []policyVerdict{
-				t.checkMethod(method),
-				t.checkReadQuota(a.URL, a.Actor),
-				t.checkBudget(),
-			} {
-				if pv.Allowed {
-					continue
-				}
-				body, _ := json.MarshalIndent(map[string]any{
-					"error":  "违反测试规则，请求未发出",
-					"policy": pv,
-					"usage":  t.policySnapshot(),
-					"next": "这条是部署方设定的硬约束，不是建议。请调整测试方式（改用只读方法 / " +
-						"减少读取组数 / 降低频率），而不是绕过本执行器。" +
-						"确需放宽时，由部署方调整对应的 ARTEX_POLICY_* 环境变量。",
-				}, "", "  ")
-				return actool.Errorf(string(body)), nil
+			// ★★★ 必须【顺序】判定并立即返回，不能塞进 slice 字面量。
+			// slice 字面量在进入 for 之前就全部求值 ⇒ 即使方法闸已把请求挡下，
+			// 后面的 checkReadQuota / checkBudget 也已经执行完：被拒绝的请求照样
+			// 消耗读取配额与速率额度（实测：一次被拒的 POST 会白扣 2 个计数）。
+			if pv := t.checkMethod(method); !pv.Allowed {
+				return t.denyRequest(pv), nil
+			}
+			if pv := t.checkReadQuota(a.URL, a.Actor); !pv.Allowed {
+				return t.denyRequest(pv), nil
+			}
+			if pv := t.checkBudget(); !pv.Allowed {
+				return t.denyRequest(pv), nil
 			}
 
 			// ── 实际发请求 ──
@@ -391,7 +391,8 @@ func (t *ToolSet) httpProbe() actool.CoreTool {
 			if a.CompareWith > 0 {
 				pl.CompareWith = a.CompareWith
 				if prev, err := t.loadObservation(a.CompareWith); err != nil || prev == nil {
-					pl.CompareNote = fmt.Sprintf("对照 observation %d 不存在，无法比较", a.CompareWith)
+					pl.CompareInvalid = true
+					pl.CompareNote = fmt.Sprintf("对照 observation %d 不存在或不可用（%v），无法比较", a.CompareWith, err)
 				} else {
 					same := prev.RespStatus == pl.RespStatus && prev.RespSHA256 == pl.RespSHA256
 					pl.CompareSame = same
@@ -447,6 +448,11 @@ func (t *ToolSet) httpProbe() actool.CoreTool {
 			if pl.CompareWith > 0 {
 				out["compare"] = map[string]any{
 					"with": pl.CompareWith, "identical": pl.CompareSame, "note": pl.CompareNote,
+					"invalid": pl.CompareInvalid,
+				}
+				if pl.CompareInvalid {
+					out["compare_warning"] = "⚠ 你指定的对照观察不可用，本次【不构成有效对照】。" +
+						"请先确认 compare_with 是真的 observation 节点 id，再重发一次。"
 				}
 			}
 			return jsonResult(out)
