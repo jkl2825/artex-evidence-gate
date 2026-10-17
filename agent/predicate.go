@@ -210,6 +210,14 @@ func (t *ToolSet) semanticCheck(evID int64, predicate string, cx expContext) (st
 				"本次不构成有效对照，会话有效性无法判定。请确认 compare_with 是真实的 observation 节点 id 后重发",
 				evID, o.CompareWith)
 		}
+		// ★ 不信任 CompareInvalid 字段：本字段是 2026-10-17 才加的，历史 observation 里
+		// 没有它（零值 false）。只信字段的话，旧数据仍会被误判成"可区分"。
+		// ⇒ 这里实际查一次对照是否存在。
+		if _, cerr := t.loadObservation(o.CompareWith); cerr != nil {
+			return "false", fmt.Sprintf("观察 %d 的对照 %d 在本任务里查不到（%v）—— "+
+				"本次不构成有效对照，会话有效性无法判定。请确认 compare_with 是真实的 observation 节点 id",
+				evID, o.CompareWith, cerr)
+		}
 		if o.CompareSame {
 			return "false", fmt.Sprintf("观察 %d 与对照 %d 【逐字节相同】—— 带凭据与不带凭据的响应完全一致，"+
 				"说明该凭据没有改变服务判定，会话有效性不成立", evID, o.CompareWith)
@@ -232,6 +240,12 @@ func (t *ToolSet) semanticCheck(evID int64, predicate string, cx expContext) (st
 			return "false", fmt.Sprintf("观察 %d 指定的对照 %d 不可用（不存在或不是 observation）—— "+
 				"本次不构成有效对照，对象存在性无法判定。请确认 compare_with 是真实的 observation 节点 id 后重发",
 				evID, o.CompareWith)
+		}
+		// ★ 同 session.valid：实际查一次，覆盖没有 CompareInvalid 字段的历史数据。
+		if _, cerr := t.loadObservation(o.CompareWith); cerr != nil {
+			return "false", fmt.Sprintf("观察 %d 的对照 %d 在本任务里查不到（%v）—— "+
+				"本次不构成有效对照，对象存在性无法判定。请确认 compare_with 是真实的 observation 节点 id",
+				evID, o.CompareWith, cerr)
 		}
 		if o.CompareSame {
 			return "false", fmt.Sprintf("观察 %d 与对照 %d 【逐字节相同】—— 两个不同对象引用得到完全相同的响应，"+
