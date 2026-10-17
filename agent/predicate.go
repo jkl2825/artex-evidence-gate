@@ -4,6 +4,7 @@ import (
 	"context"
 	"encoding/json"
 	"fmt"
+	"net/url"
 	"strings"
 	"time"
 
@@ -213,10 +214,26 @@ func (t *ToolSet) semanticCheck(evID int64, predicate string, cx expContext) (st
 		// ★ 不信任 CompareInvalid 字段：本字段是 2026-10-17 才加的，历史 observation 里
 		// 没有它（零值 false）。只信字段的话，旧数据仍会被误判成"可区分"。
 		// ⇒ 这里实际查一次对照是否存在。
-		if _, cerr := t.loadObservation(o.CompareWith); cerr != nil {
+		prev, cerr := t.loadObservation(o.CompareWith)
+		if cerr != nil {
 			return "false", fmt.Sprintf("观察 %d 的对照 %d 在本任务里查不到（%v）—— "+
 				"本次不构成有效对照，会话有效性无法判定。请确认 compare_with 是真实的 observation 节点 id",
 				evID, o.CompareWith, cerr)
+		}
+		// ★★★ E1 语义收口（2026-10-17）：
+		//   原实现只要「两条响应不同」就判会话有效 —— 两个不同的 200 错误页（nonce/时间戳不同）
+		//   就足以"证明"凭据改变了服务判定。这是最大的假阳性来源。
+		//   现在补三条可判定的前提，缺一即 false：
+		if !isAnonymousActor(prev.Actor) {
+			return "false", fmt.Sprintf("对照 %d 的主体是 %q，不是匿名基线 —— "+
+				"证明会话有效必须与【匿名】响应做对照（带凭据 vs 不带凭据），"+
+				"两条都带身份的响应无法证明凭据起了作用", o.CompareWith, prev.Actor)
+		}
+		if !sameEndpoint(prev.ActualURL, o.ActualURL) {
+			return "false", fmt.Sprintf("对照 %d 的端点是 %q，与本观察 %q 不同 —— "+
+				"不同端点的响应天然不同，不能作为「凭据改变了判定」的证据。"+
+				"请对【同一个 URL】分别发匿名与带身份两次",
+				o.CompareWith, prev.ActualURL, o.ActualURL)
 		}
 		if o.CompareSame {
 			return "false", fmt.Sprintf("观察 %d 与对照 %d 【逐字节相同】—— 带凭据与不带凭据的响应完全一致，"+
@@ -242,10 +259,29 @@ func (t *ToolSet) semanticCheck(evID int64, predicate string, cx expContext) (st
 				evID, o.CompareWith)
 		}
 		// ★ 同 session.valid：实际查一次，覆盖没有 CompareInvalid 字段的历史数据。
-		if _, cerr := t.loadObservation(o.CompareWith); cerr != nil {
+		prevObj, cerr := t.loadObservation(o.CompareWith)
+		if cerr != nil {
 			return "false", fmt.Sprintf("观察 %d 的对照 %d 在本任务里查不到（%v）—— "+
 				"本次不构成有效对照，对象存在性无法判定。请确认 compare_with 是真实的 observation 节点 id",
 				evID, o.CompareWith, cerr)
+		}
+		// ★★★ E1 语义收口（同 session.valid）：
+		//   存在性对照必须满足「同一接口、不同对象」——否则任意两个不同错误页
+		//   都能互相"证明"对象存在。
+		if strings.TrimSpace(prevObj.Object) == "" {
+			return "false", fmt.Sprintf("对照 %d 没有声明 object —— "+
+				"存在性对照必须两条都写明对象引用（如 item:1 与 item:999），"+
+				"否则无法判断你比的是不是不同对象", o.CompareWith)
+		}
+		if prevObj.Object == o.Object {
+			return "false", fmt.Sprintf("对照 %d 的 object 与本观察相同（%q）—— "+
+				"存在性对照必须是【另一个对象】，同一对象的两条响应只能证明可重复性，"+
+				"不能证明对象存在", o.CompareWith, o.Object)
+		}
+		if !sameEndpoint(prevObj.ActualURL, o.ActualURL) {
+			return "false", fmt.Sprintf("对照 %d 的端点是 %q，与本观察 %q 不同 —— "+
+				"不同接口的响应天然不同，不能作为对象存在性的对照",
+				o.CompareWith, prevObj.ActualURL, o.ActualURL)
 		}
 		if o.CompareSame {
 			return "false", fmt.Sprintf("观察 %d 与对照 %d 【逐字节相同】—— 两个不同对象引用得到完全相同的响应，"+
@@ -315,22 +351,63 @@ func (t *ToolSet) checkEvidenceRef(id int64) (string, string) {
 // ── V3：公共基线 ────────────────────────────────────────────────────────────
 
 // baselinePayload 是基线节点的内容。绑定「目标 / 主体 / 对象 / 用途」四元组 + 有效期。
-func baselinePayload(kind, target, actor, object, purpose string, evidenceRef int64, ttls int, invalidIf string) map[string]any {
+//
+// ★ E2 修正（2026-10-17）：有效期从【源观察的时间】起算，不从 time.Now() 起算。
+//
+//	原来用 now+ttl ⇒ 把一条几天前的旧观察重新登记一次，就能"续命"到永远，
+//	而证据一次都没刷新。审计方（d61e00ba）指出这是"TTL 无限续期"。
+//	现在：anchor = 源观察的 At；若拿不到就用 now（并在 invalid_if 里说明）。
+func baselinePayload(kind, target, actor, object, purpose string, evidenceRef int64, ttls int, invalidIf string, anchor time.Time) map[string]any {
 	if ttls <= 0 {
 		ttls = 900 // 默认 15 分钟：会话健康这类状态会漂移，不能无限复用
 	}
-	until := time.Now().Add(time.Duration(ttls) * time.Second).UTC()
+	base := anchor
+	if base.IsZero() {
+		base = time.Now()
+	}
+	until := base.UTC().Add(time.Duration(ttls) * time.Second)
 	pl := map[string]any{
 		"kind": kind, "target": target, "actor": actor, "object": object, "purpose": purpose,
 		"evidence_ref":  evidenceRef,
 		"ttl_seconds":   ttls,
+		"anchor_at":     base.UTC().Format(time.RFC3339), // ★ 有效期的起点（源观察时间）
 		"valid_until":   until.Format(time.RFC3339),
 		"invalid_if":    invalidIf,
-		"predicate_ver": 1,
-		"summary": fmt.Sprintf("公共基线[%s] target=%s actor=%s object=%s purpose=%s（有效期至 %s）",
-			kind, target, actor, object, purpose, until.Format("15:04:05")),
+		"predicate_ver": 2,
+		"summary": fmt.Sprintf("公共基线[%s] target=%s actor=%s object=%s purpose=%s（自 %s 起 %ds，至 %s）",
+			kind, target, actor, object, purpose, base.Format("15:04:05"), ttls, until.Format("15:04:05")),
 	}
 	return pl
+}
+
+// sameEndpoint 判断两条观察是否指向【同一个端点】（同 scheme+host+path，忽略 query）。
+//
+// ★ E1 修正（2026-10-17）：证明 session.valid / object.exists 的对照
+//
+//	必须是【同一端点】的另一条响应。原来是任意两条观察都能互相当对照 ——
+//	于是"两个不同的 200 错误页"就能互相"证明"会话有效。
+func sameEndpoint(a, b string) bool {
+	ua, ea := url.Parse(strings.TrimSpace(a))
+	ub, eb := url.Parse(strings.TrimSpace(b))
+	if ea != nil || eb != nil || ua.Host == "" || ub.Host == "" {
+		return false
+	}
+	// ★ scheme 必须一致：http 与 https 是不同端点，响应语义可能完全不同
+	//   （测试抓到的真 bug：原实现漏了这一条，http://x/a 与 https://x/a 被判同端点）
+	if !strings.EqualFold(ua.Scheme, ub.Scheme) {
+		return false
+	}
+	if !strings.EqualFold(ua.Host, ub.Host) {
+		return false
+	}
+	pa, pb := ua.Path, ub.Path
+	if pa == "" {
+		pa = "/"
+	}
+	if pb == "" {
+		pb = "/"
+	}
+	return pa == pb
 }
 
 // checkBaseline：采纳基线前的三项程序检查 —— 存在 / 未过期 / 上下文相容。
@@ -453,7 +530,7 @@ func (t *ToolSet) registerBaseline() actool.CoreTool {
 				return actool.Errorf(fmt.Sprintf("基线登记失败（%s 这一层未通过，证据必须是结构化观察）：%s", basePred, why)), nil
 			}
 			pl := baselinePayload(a.Kind, a.Target, a.Actor, a.Object, a.Purpose,
-				a.EvidenceRef, a.TTLSeconds, a.InvalidIf)
+				a.EvidenceRef, a.TTLSeconds, a.InvalidIf, time.Time{})
 			id, err := t.ts.AddNode(kindBaseline, pl, 0, "confirmed", t.worker, nil)
 			if err != nil {
 				return actool.Errorf(fmt.Sprintf("基线登记失败（写库）：%v", err)), nil
@@ -464,7 +541,7 @@ func (t *ToolSet) registerBaseline() actool.CoreTool {
 				"ttl_seconds":   pl["ttl_seconds"],
 				"context":       map[string]any{"target": a.Target, "actor": a.Actor, "object": a.Object, "purpose": a.Purpose},
 				"how_to_use":    "在 audit_validity 的 checks 里用 baseline_id 代替 evidence_ref，并在 context 里填同样的 target/actor/object/purpose。",
-				"predicate_ver": 1,
+				"predicate_ver": 2,
 			})
 		})
 }
@@ -608,7 +685,12 @@ func (t *ToolSet) validityGate(it factItem, intent int64) error {
 	t.logGateDecision(intent, "deny",
 		"有效性审计判定 insufficient（缺："+unsat+"），拒绝把否定性结论写入", auditID, kw)
 	return fmt.Errorf("★ 有效性门拒绝写回：audit_validity 判定 verdict=insufficient，缺少必需层 [%s]。\n"+
-		"请先补齐这些层的对照观察（按 audit_validity 返回的 required_action），再重新提交；\n"+
+		"你有两条出路，按你的工具集选一条：\n"+
+		"  (a) 若你能调用 audit_validity/http_probe：按它返回的 required_action 补齐这些层的对照观察，再重新提交；\n"+
+		"  (b) 若你的工具集里【没有】audit_validity（例如 mainagent，只有 record_fact）：\n"+
+		"      不要勉强下否定结论 —— 用 add_task_hint 把这条待核结论交接给有 http_probe/audit_validity 的任务 agent，\n"+
+		"      由它复核后再写回。或者把结论降级成 conclusion=observation（只陈述你看到了什么，不断言「不存在」）。\n"+
+		"★ 不要为了通过这一层去改措辞、换标签或伪造对照 —— 那些会被程序识破，且会污染结论。\n"+
 		"或者如实把本结论标为无法判定：confidence=\"inconclusive\"、summary 里写明「无法判定」——"+
 		"平台接受诚实的「无法判定」，但不接受证据不足却写成确定结论。", unsat)
 }
@@ -626,8 +708,11 @@ func (t *ToolSet) auditValidity() actool.CoreTool {
 			"但基线必须【未过期】且与 context 里的 目标/主体/对象/用途 完全一致，否则该层判 false。\n"+
 			"用法：提交「否定结论 + 意图 id + 本实验 context + 各层对照」。\n"+
 			"返回：sufficient=可以记 not_reproduced；insufficient=只能记 inconclusive，按 unsatisfied 补齐再判。\n"+
-			"⚠️ 本工具只校验【形式与引用】（谓词已注册 / 证据真实存在 / 必需层齐备 / 基线有效且上下文相容），"+
-			"【不校验语义】（那条观察是否真的支撑你的断言，仍需结构化执行器的观察明细或人工复核）。",
+			"⚠️ 本工具校验【形式 + 有界的语义检查】："+
+			"形式（谓词已注册 / 证据真实存在 / 必需层齐备 / 基线有效且上下文相容）"+
+			"+ 语义（对照必须是匿名基线或不同对象 / 必须同端点 / 必要时主体可区分）。\n"+
+			"★ 仍未覆盖：跨服务对象映射、凭据 audience/租户条件、非 HTTP 通道的观察 —— "+
+			"这些保持 unknown 或交人工复核，不会被判成 true。",
 		obj(map[string]any{
 			"intent_id":      idp("产生本结论的意图 id（必填：写回门按意图核对审计）"),
 			"negative_claim": str("你打算下的否定结论（一句话）。例如「该接口不存在越权访问」"),
@@ -643,8 +728,10 @@ func (t *ToolSet) auditValidity() actool.CoreTool {
 				"description": "结论是否针对某个【具体对象】（记录/文件/订单…）？是则要求 object.exists 层"},
 			"checks": map[string]any{"type": "array",
 				"description": "你实际做过的有效性对照。每层一条：{predicate, evidence_ref | baseline_id, note}。" +
-					"predicate 取已注册名（transport.reachable / session.valid / object.exists / " +
-					"observation.available / method.applicable）；evidence_ref = 本次观察的节点 id；" +
+					"predicate 取已注册名：transport.reachable / session.valid / object.exists / " +
+					"observation.available / out_of_scope / method.applicable。" +
+					"★ out_of_scope 是【总是必需】的前置层（目标必须在授权边界内），" +
+					"前面版本漏列，按文档填会缺这一层 —— 已补；evidence_ref = 本次观察的节点 id；" +
 					"baseline_id = 复用已登记的公共基线（须未过期且与 context 相容）。二者至少给一个。",
 				"items": obj(map[string]any{
 					"predicate":    str("已注册的机器谓词名"),
