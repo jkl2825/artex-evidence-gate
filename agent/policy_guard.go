@@ -220,19 +220,38 @@ func readQuotaKey(rawURL string) (key, val string, objectLike bool) {
 		}
 		sort.Strings(names)
 		var b strings.Builder
-		allObjectLike := true
+		// ★★★ 语义（2026-10-17 第三版，前两版都被审计方证伪）：
+		//
+		//  【按参数分别计数】：只有"像对象标识"的非空值才进 val（= 计入读取配额）。
+		//  载荷形状的值忽略 —— 但它【不豁免同一请求里的其它参数】。
+		//
+		//  ★ 前两版的错，及对应绕过：
+		//   v1: if !looksLikeObjectValue(v) { allObjectLike=false }
+		//       ?id=6&unused=            ⇒ 空值让整体豁免
+		//   v2: hasObject && !hasPayload
+		//       ?id=6&unused=%27         ⇒ 非空标点让整体豁免
+		//   ⇒ 都被审计方（efc2bd5d）实测证伪。共同错误：把"整请求"当成一个判定单位。
+		//
+		//  v3 正确语义：判定单位是【参数值】。
+		//   ?id=6&unused=%27  ⇒ val="id=6"   ⇒ 计数（unused 被忽略，不影响 id）
+		//   ?id=1'            ⇒ val=""       ⇒ 不计数（纯注入载荷）
+		//   ?a=1&b=2          ⇒ val="a=1&b=2"⇒ 计数
+		hasObject := false
 		for _, k := range names {
 			v := vals.Get(k)
-			// ★ 逐【值】判断是不是测试载荷（不要判整个 "k=v&k=v" 组合串 —— 它自带 '=' 会被误判）
-			if !looksLikeObjectValue(v) {
-				allObjectLike = false
+			if strings.TrimSpace(v) == "" {
+				continue // 空值不参与：既不是对象，也不是载荷
 			}
+			if !looksLikeObjectValue(v) {
+				continue // 载荷形状的值本身不计数（但也不豁免其它参数）
+			}
+			hasObject = true
 			b.WriteString(k)
 			b.WriteString("=")
 			b.WriteString(v)
 			b.WriteString("&")
 		}
-		return host + "|" + path, strings.TrimSuffix(b.String(), "&"), allObjectLike
+		return host + "|" + path, strings.TrimSuffix(b.String(), "&"), hasObject
 	}
 	// 无 query：把路径末段当对象标识
 	segs := strings.Split(strings.Trim(path, "/"), "/")
@@ -243,6 +262,7 @@ func readQuotaKey(rawURL string) (key, val string, objectLike bool) {
 		if looksLikeObjectValue(last) {
 			return host + "|" + prefix, "#" + last, true
 		}
+		_ = last
 		// 末段是载荷（/api/user/1'/...）⇒ 不是对象遍历
 		return host + "|" + path, path, false
 	}
