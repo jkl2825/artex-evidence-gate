@@ -270,6 +270,11 @@ func obj(props map[string]any, required ...string) map[string]any {
 	return m
 }
 func str(desc string) map[string]any { return map[string]any{"type": "string", "description": desc} }
+
+// boolp 声明一个布尔参数（带说明）。
+func boolp(desc string) map[string]any {
+	return map[string]any{"type": "boolean", "description": desc}
+}
 func intp(desc string) map[string]any {
 	return map[string]any{"type": "integer", "description": desc}
 }

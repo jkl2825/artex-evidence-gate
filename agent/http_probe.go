@@ -3,11 +3,13 @@ package agent
 import (
 	"context"
 	"crypto/sha256"
+	"crypto/tls"
 	"encoding/hex"
 	"encoding/json"
 	"fmt"
 	"io"
 	"net/http"
+	"net/http/cookiejar"
 	"regexp"
 	"strconv"
 	"strings"
@@ -252,6 +254,10 @@ func (t *ToolSet) httpProbe() actool.CoreTool {
 				})},
 			"note":            str("一句话说明你为什么要发这一发（供人工复核）"),
 			"timeout_seconds": intp("超时秒数；省略=15"),
+			"host_override":   str("★ 虚拟主机探测：只改 Host 头（不影响实际连的 IP）。例：连 10.0.0.5 但想测 vhost 时填 admin.example.com。注意：Go 里必须设 req.Host 才生效，只塞 headers 里的 Host 是无效的——本条已处理"),
+			"insecure_tls":    boolp("★ 跳过 TLS 证书校验。自签证书 / 内网 HTTPS 环境必须开，否则连不上"),
+			"cookie_jar": boolp("★ 本次调用内启用 Cookie 自动管理。做多步会话（登录→带会话测试）时开，" +
+				"省得手工搬 Cookie"),
 		}, "url", "actor"),
 		func(ctx context.Context, in json.RawMessage) (actool.Result, error) {
 			var a struct {
@@ -267,6 +273,14 @@ func (t *ToolSet) httpProbe() actool.CoreTool {
 				Extract     []extractRule     `json:"extract"`
 				Note        string            `json:"note"`
 				TimeoutSec  int               `json:"timeout_seconds"`
+				// ★ 以下三个是"基座能力"短板补齐（2026-10-17）：
+				//   host_override  —— 只设 Header["Host"] 对 Go 无效（req.Host 才是真的），
+				//                     不补这条就做不了虚拟主机探测。
+				//   insecure_tls   —— 自签证书 / 内网 HTTPS 环境，不跳过校验就打不了。
+				//   cookie_jar     —— 多步会话（登录→带会话测试）靠手工搬 Cookie 既费 token 又易错。
+				HostOverride string `json:"host_override"`
+				InsecureTLS  bool   `json:"insecure_tls"`
+				CookieJar    bool   `json:"cookie_jar"`
 			}
 			_ = json.Unmarshal(in, &a)
 			if strings.TrimSpace(a.URL) == "" {
@@ -347,8 +361,32 @@ func (t *ToolSet) httpProbe() actool.CoreTool {
 			if req.Header.Get("User-Agent") == "" {
 				req.Header.Set("User-Agent", "artex-structured-http/1")
 			}
+			// ★ host_override：Go 的 Host 头必须设在 req.Host 上，
+			//   只塞 Header["Host"] 会被忽略（这是虚拟主机探测做不了的根因）。
+			if h := strings.TrimSpace(a.HostOverride); h != "" {
+				req.Host = h
+				// 同时保留在 Header 里，便于部分服务端按 Header 读
+				req.Header.Set("Host", h)
+			}
+			// ★ cookie_jar：同一个 http_probe 调用链内的多次跳转/复用共享会话。
+			//   跨调用共享需要服务端状态，这里只保证"一次探测内的会话连续性"。
+			var jar http.CookieJar
+			if a.CookieJar {
+				jar, _ = cookiejar.New(nil)
+			}
+			// ★ insecure_tls：自签 / 内网 HTTPS
+			var tlsCfg *tls.Config
+			if a.InsecureTLS {
+				tlsCfg = &tls.Config{InsecureSkipVerify: true} //nolint:gosec // 显式由调用方开启
+			}
+			tr := http.DefaultTransport.(*http.Transport).Clone()
+			if tlsCfg != nil {
+				tr.TLSClientConfig = tlsCfg
+			}
 			cli := &http.Client{
-				Timeout: time.Duration(a.TimeoutSec) * time.Second,
+				Transport: tr,
+				Jar:       jar,
+				Timeout:   time.Duration(a.TimeoutSec) * time.Second,
 				CheckRedirect: func(r *http.Request, via []*http.Request) error {
 					if len(via) >= 10 {
 						return fmt.Errorf("重定向次数过多")
@@ -411,7 +449,9 @@ func (t *ToolSet) httpProbe() actool.CoreTool {
 				Actor: a.Actor, Object: a.Object, Purpose: a.Purpose,
 				ReqMethod: method, ReqHeaders: redactHeaders(a.Headers), ReqBodyLen: len(a.Body),
 				RespStatus: resp.StatusCode, RespHeaders: respHeaders,
-				RespBody: excerpt(raw, 2000), RespLen: len(raw), RespSHA256: hex.EncodeToString(sum[:]),
+				// ★ 2026-10-17：2000 → 8000。原来 2000 字节连一个 HTML 页头都不够，
+				//   模型看不到内容就判断不了。这是纯损失，不是"省 token"的设计取舍。
+				RespBody: excerpt(raw, 8000), RespLen: len(raw), RespSHA256: hex.EncodeToString(sum[:]),
 				ElapsedMS: elapsed, At: time.Now().UTC().Format(time.RFC3339),
 				Extracted: runExtract(a.Extract, respHeaders, string(raw)),
 				ModelNote: a.Note,
@@ -476,8 +516,10 @@ func (t *ToolSet) httpProbe() actool.CoreTool {
 				"status":         resp.StatusCode,
 				"elapsed_ms":     elapsed,
 				"body_len":       len(raw),
-				"body_excerpt":   excerpt(raw, 800),
-				"resp_headers":   respHeaders,
+				// ★ 2026-10-17：800 → 4000。800 字节大约只够看到 <head>，
+				//   接口返回的 JSON 稍微长一点就全被截掉，模型只能靠猜。
+				"body_excerpt": excerpt(raw, 4000),
+				"resp_headers": respHeaders,
 				"context": map[string]any{
 					"target": pl.Target, "actor": pl.Actor, "object": pl.Object, "purpose": pl.Purpose,
 				},
