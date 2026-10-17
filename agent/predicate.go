@@ -185,6 +185,31 @@ func (t *ToolSet) semanticCheck(evID int64, predicate string, cx expContext) (st
 		return "false", fmt.Sprintf("观察 %d 的 payload 无法解析：%v", evID, err)
 	}
 
+	// ★ E4-b（2026-10-17）：非 HTTP 渠道的观察要有【可复算的命令 + 退出码】才算数。
+	//
+	//   原来语义谓词只认 http_probe 写的观察，Bash/TCP/DNS/浏览器做的检查
+	//   完全无法支撑"不存在 / 不可达"这类否定性结论 —— 纯 TCP 服务没有 HTTP 等价物，
+	//   结论就永远写不进去。现在放开了渠道，但必须挡住"模型自己写一份说辞"：
+	//     · cmd 非空（别人照着能重跑）
+	//     · exit_code 显式给出（区分"填了 0"和"没填"）
+	//   缺任何一项，这条观察只能当线索，不能当结论依据。
+	if ch := strings.ToLower(strings.TrimSpace(o.Channel)); ch != "" && ch != "http" && ch != "https" {
+		if strings.TrimSpace(o.Cmd) == "" {
+			return "false", fmt.Sprintf("观察 %d 的渠道是 %q（非 HTTP），但没有记录执行的命令（cmd）。"+
+				"非 HTTP 观察必须能复算，否则无法作为结论依据 —— 请用 record_observation 补上命令后重记", evID, ch)
+		}
+		if !o.HasExit {
+			return "false", fmt.Sprintf("观察 %d 的渠道是 %q（非 HTTP），但没有记录退出码（exit_code）。"+
+				"缺退出码就无法区分「命令跑成功了但没输出」和「命令根本没跑」 —— "+
+				"请用 record_observation 重记并显式给出 exit_code（0 也要给）", evID, ch)
+		}
+		// 非 HTTP 渠道不承载 HTTP 语义谓词：session.valid / object.exists 仍需 http_probe
+		if predicate == "session.valid" || predicate == "object.exists" {
+			return "false", fmt.Sprintf("观察 %d 是 %q 渠道的观察，不能支撑 %q 这类 HTTP 语义谓词"+
+				"（会话有效 / 对象存在要看真实请求响应的差异）。请用 http_probe 重做该对照", evID, ch, predicate)
+		}
+	}
+
 	switch predicate {
 	case "transport.reachable":
 		if o.RespStatus == 0 {

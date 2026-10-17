@@ -8,6 +8,7 @@ import (
 	"net/url"
 	"strconv"
 	"strings"
+	"time"
 
 	"github.com/Autumn-27/artex/db"
 	actool "github.com/Autumn-27/norma/tool"
@@ -669,6 +670,10 @@ func (t *ToolSet) WorkerTools() []actool.CoreTool {
 		// 与请求响应原文，模型只写摘要。语义谓词（session.valid / object.exists）据此做可判检查，
 		// 而非只看「引用是否存在」。对应上游「首个协议原生通道采用结构化 HTTP 执行器」。
 		t.httpProbe(),
+		// ★ record_observation（本地新增 2026-10-17 · E4-b）：非 HTTP 结构化观察。
+		// 让 Bash/TCP/DNS/浏览器的检查能支撑否定性结论，同时用
+		// channel+target+cmd+exit_code 四要素挡住"模型自己写证据"。
+		t.recordObservation(),
 		// ★ honeypot_check（本地新增 2026-10-17）：蜜罐静态指纹线索。
 		// R05 的五层有效性都默认「测的对象是真的」。若目标是蜜罐，「未复现」就是对假图的判断。
 		// 但它【只是线索不是判定】：签名库来自第三方、本机未独立核实、只覆盖开源默认配置。
@@ -718,4 +723,166 @@ func (t *ToolSet) AllDomainTools() []actool.CoreTool {
 		}
 	}
 	return out
+}
+
+// recordObservation 记录一条【非 HTTP】结构化观察。
+//
+// ★ E4-b（2026-10-17）：原来语义谓词只认 http_probe 写的观察节点，
+// 于是 Bash 里做的检查（端口关不关、DNS 解不解析、浏览器里点没点开）
+// 全都没法支撑"不存在 / 不可达"这类否定性结论 —— 模型只能改用 HTTP 重做，
+// 而有些目标（纯 TCP 服务、没有 HTTP 面的内网主机）根本没有 HTTP 等价物。
+//
+// 但它【不能变成"模型自己写证据"的后门】，所以强制要求：
+//
+//	· channel  必须填（且不能是 http —— http 只走 http_probe，那条路有真实请求)
+//	· target   必须填
+//	· cmd      必须填（可复算：别人照着能重跑）
+//	· exit_code 必须显式给出（用 has_exit_code 区分"没填"和"填了 0"）
+//
+// 缺任何一项就拒绝写入。谓词层（predicate.go）还会再校验一次。
+func (t *ToolSet) recordObservation() actool.CoreTool {
+	return t.writeExpTool("record_observation",
+		"记录一条【非 HTTP】结构化观察（Bash 命令 / TCP 连通性 / DNS 解析 / 浏览器交互）。"+
+			"用途：让这类检查能支撑「不存在 / 不可达 / 未发现」这类否定性结论 —— "+
+			"否则语义谓词只认 http_probe 的观察，"+
+			"而纯 TCP 服务或没有 HTTP 面的目标就没有等价物，结论永远写不进去。"+
+			"⚠ 强制要求 channel/target/cmd/exit_code 全部如实填写："+
+			"这个工具记录的是【你实际执行的命令及其结果】，不是让你补一份说辞。",
+		obj(map[string]any{
+			"channel": str("★ 观测渠道：bash | tcp | dns | browser | other（不能是 http —— HTTP 请用 http_probe）"),
+			"target":  str("★ 目标：host:port / 域名 / URL / 文件路径"),
+			"cmd": str("★ 实际执行的命令原文（可复算：别人照着能重跑）。" +
+				"例：nc -zv -w3 10.0.0.5 22"),
+			"exit_code":      intp("★ 命令退出码（0=成功）。必须显式给出，用来区分「填了 0」和「没填」"),
+			"stdout_excerpt": str("stdout / stderr 摘录（长输出截断即可）"),
+			"actor":          str("身份上下文：anonymous / session:<名字>"),
+			"object":         str("对象引用（可选，如 port:22 / file:/etc/passwd）"),
+			"purpose":        str("本次观察的用途"),
+			"compare_with":   idp("可选对照：另一条 observation 的 id"),
+			"note":           str("一句话说明为什么做这一发（供人工复核）"),
+		}, "channel", "target", "cmd", "exit_code"),
+		func(ctx context.Context, in json.RawMessage) (actool.Result, error) {
+			var a struct {
+				IntentID      json.RawMessage `json:"intent_id"`
+				Channel       string          `json:"channel"`
+				Target        string          `json:"target"`
+				Cmd           string          `json:"cmd"`
+				ExitCode      *int            `json:"exit_code"`
+				StdoutExcerpt string          `json:"stdout_excerpt"`
+				Actor         string          `json:"actor"`
+				Object        string          `json:"object"`
+				Purpose       string          `json:"purpose"`
+				CompareWith   int64           `json:"compare_with"`
+				Note          string          `json:"note"`
+			}
+			_ = json.Unmarshal(in, &a)
+
+			ch := strings.ToLower(strings.TrimSpace(a.Channel))
+			if ch == "" {
+				return actool.Errorf("channel 必填（bash / tcp / dns / browser / other）"), nil
+			}
+			if ch == "http" || ch == "https" {
+				return actool.Errorf("HTTP 观察请用 http_probe —— 它会记录真实请求/响应、时间、渠道，" +
+					"并且能被范围闸与测试规则闸约束。record_observation 只用于非 HTTP 渠道。"), nil
+			}
+			if strings.TrimSpace(a.Target) == "" {
+				return actool.Errorf("target 必填（host:port / 域名 / URL / 文件路径）"), nil
+			}
+			if strings.TrimSpace(a.Cmd) == "" {
+				return actool.Errorf("cmd 必填 —— 必须写你【实际执行的命令】。" +
+					"这个字段是可复算性的基础：没有它，这条观察只是一句自称。"), nil
+			}
+			if a.ExitCode == nil {
+				return actool.Errorf("exit_code 必填（0 也要显式给出）—— " +
+					"它是判断「命令成功/失败」的唯一依据；缺了它无法区分「跑成功了但没输出」和「根本没跑」"), nil
+			}
+			if a.Actor == "" {
+				a.Actor = "anonymous"
+			}
+
+			intentID := pid(a.IntentID)
+			// ★ 非 HTTP 观察也要过授权范围闸：目标是 host:port 也按 host 判。
+			if host := obsHost(a.Target); host != "" {
+				guard := t.loadScopeGuard()
+				if blocked, verdict := guard.enforce(guard.checkHost(host)); blocked {
+					return actool.Errorf(fmt.Sprintf("目标超出授权范围，观察未记录：%s（%s）",
+						verdict.Layer, verdict.Rule)), nil
+				}
+			}
+
+			pl := observationPayload{
+				Channel:   ch,
+				Target:    a.Target,
+				ActualURL: a.Target,
+				Actor:     a.Actor,
+				Object:    a.Object,
+				Purpose:   a.Purpose,
+				Cmd:       a.Cmd,
+				ExitCode:  *a.ExitCode,
+				HasExit:   true,
+				At:        time.Now().UTC().Format(time.RFC3339),
+			}
+			if a.StdoutExcerpt != "" {
+				pl.RespBody = excerpt([]byte(a.StdoutExcerpt), 4000)
+				pl.RespLen = len(a.StdoutExcerpt)
+			}
+			if a.CompareWith > 0 {
+				pl.CompareWith = a.CompareWith
+				// 非 HTTP 对照只做「存在性 + 是否同任务」校验，不做逐字节比较
+				if other, err := t.ts.GetNodeWithSources(a.CompareWith); err != nil || other == nil {
+					pl.CompareInvalid = true
+					pl.CompareNote = "对照节点不存在"
+				} else if other.Kind != kindObservation {
+					pl.CompareInvalid = true
+					pl.CompareNote = fmt.Sprintf("对照节点 %d 不是 observation", a.CompareWith)
+				}
+			}
+
+			id, err := t.ts.AddNode(kindObservation, mustMap(pl), 0, "confirmed", t.worker, nil)
+			if err != nil {
+				return actool.Errorf(fmt.Sprintf("观察落盘失败：%v", err)), nil
+			}
+			if intentID > 0 {
+				_ = t.ts.Link(pid(a.IntentID), db.RelYields, id)
+			}
+			out, _ := json.MarshalIndent(map[string]any{
+				"observation_id": id,
+				"channel":        ch,
+				"target":         a.Target,
+				"cmd":            a.Cmd,
+				"exit_code":      *a.ExitCode,
+				"note": "已记录为非 HTTP 结构化观察；下否定结论时可用它作为 evidence_ref。" +
+					"注意：它不证明任何 HTTP 语义（session.valid / object.exists 仍需 http_probe）。",
+			}, "", "  ")
+			return actool.Text(string(out)), nil
+		})
+}
+
+// obsHost 从「host:port / 域名 / URL / 文件路径」里取出用于范围判定的 host。
+// 非网络目标（文件路径等）返回空串 —— 那种目标不走授权范围闸。
+func obsHost(target string) string {
+	t := strings.TrimSpace(target)
+	if t == "" {
+		return ""
+	}
+	if strings.Contains(t, "://") {
+		if h, _ := scopeHostFromURL(t); h != "" {
+			return h
+		}
+	}
+	// host:port
+	if h, _, err := net.SplitHostPort(t); err == nil && h != "" {
+		return h
+	}
+	// 纯 IP / 纯域名（含不以 / 开头的路径式目标）：只接受看起来像主机的
+	if strings.HasPrefix(t, "/") || strings.Contains(t, " ") {
+		return ""
+	}
+	if net.ParseIP(t) != nil {
+		return t
+	}
+	if strings.Contains(t, ".") && !strings.Contains(t, "/") {
+		return t
+	}
+	return ""
 }

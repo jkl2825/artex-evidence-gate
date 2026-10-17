@@ -1,9 +1,11 @@
 package agent
 
 import (
+	"bytes"
 	"context"
 	"crypto/sha256"
 	"crypto/tls"
+	"encoding/base64"
 	"encoding/hex"
 	"encoding/json"
 	"fmt"
@@ -18,6 +20,7 @@ import (
 	actool "github.com/Autumn-27/norma/tool"
 
 	"github.com/Autumn-27/artex/db"
+	"unicode/utf8"
 )
 
 // ════════════════════════════════════════════════════════════════════════════
@@ -109,6 +112,17 @@ type observationPayload struct {
 	// Truncated / ReadError / BodyCap：响应是否被截断或读取出错。
 	// ★ io.LimitReader 静默截断 + ReadAll 错误被丢弃，会让"前 1MiB 相同、后面不同"
 	//   的两条响应被判相同；缺失的证明不能被当作相等。
+	// ★ Cmd / ExitCode / HasExit（2026-10-17 · E4-b）：
+	//   非 HTTP 渠道（bash / tcp / dns / browser）的观察必须带【可复算的命令】和【退出码】，
+	//   否则它就只是"模型自称看过"，不能作为否定性结论的依据。
+	//   HasExit 用指针语义替代零值：exit_code=0 是合法值，不能当成"没填"。
+	Cmd string `json:"cmd,omitempty"`
+	// ★ 不能加 omitempty：exit_code=0（命令成功）是最常见的情况，
+	//   omitempty 会把它整条吞掉，读 payload 的人就分不清"没填"和"填了 0"。
+	//   用 HasExit 单独表达"是否填过"，两者配合才无损。
+	ExitCode int  `json:"exit_code"`
+	HasExit  bool `json:"has_exit_code,omitempty"`
+
 	Truncated bool              `json:"truncated,omitempty"`
 	ReadError string            `json:"read_error,omitempty"`
 	BodyCap   int               `json:"body_cap_bytes,omitempty"`
@@ -202,6 +216,44 @@ func jsonPath(v any, path string) (string, bool) {
 	}
 }
 
+// excerptAt 从字节位置 off 开始取最多 n 字节，并把无效 UTF-8 收拾干净。
+//
+// ★ 2026-10-17：原来只有 excerpt(b, n)（永远从头取 4000 字节），
+//
+//	长响应后面的内容模型永远看不到。加 offset 后可翻页取全。
+//	off 越界时返回空串 + 调用方据此判断"已经到底"。
+func excerptAt(b []byte, off, n int) string {
+	if off < 0 {
+		off = 0
+	}
+	if off >= len(b) {
+		return ""
+	}
+	end := off + n
+	if end > len(b) {
+		end = len(b)
+	}
+	seg := b[off:end]
+	// 从中间切可能切在多字节字符中间：去掉尾部不完整序列
+	for len(seg) > 0 {
+		if r, size := utf8.DecodeLastRune(seg); r == utf8.RuneError && size <= 1 {
+			seg = seg[:len(seg)-1]
+			continue
+		}
+		break
+	}
+	return string(seg)
+}
+
+// nextBodyOffset 计算下一页起点；返回 -1 表示已经到末尾。
+func nextBodyOffset(off, total int) int {
+	next := off + 4000
+	if next >= total {
+		return -1
+	}
+	return next
+}
+
 func excerpt(b []byte, n int) string {
 	if len(b) <= n {
 		return string(b)
@@ -256,6 +308,10 @@ func (t *ToolSet) httpProbe() actool.CoreTool {
 			"timeout_seconds": intp("超时秒数；省略=15"),
 			"host_override":   str("★ 虚拟主机探测：只改 Host 头（不影响实际连的 IP）。例：连 10.0.0.5 但想测 vhost 时填 admin.example.com。注意：Go 里必须设 req.Host 才生效，只塞 headers 里的 Host 是无效的——本条已处理"),
 			"insecure_tls":    boolp("★ 跳过 TLS 证书校验。自签证书 / 内网 HTTPS 环境必须开，否则连不上"),
+			"body_offset": intp("★ 响应体起点（字节）。响应很长时用来翻页：先看返回里的 body_len，" +
+				"再用 body_offset=4000 / 8000 … 取后续片段。省略=0"),
+			"body_base64": str("★ 二进制请求体（base64 编码）。文件上传 / protobuf / 序列化 payload 用；" +
+				"给了它就用它，优先于 body。注意 Content-Type 仍要自己填 headers"),
 			"cookie_jar": boolp("★ 本次调用内启用 Cookie 自动管理。做多步会话（登录→带会话测试）时开，" +
 				"省得手工搬 Cookie"),
 		}, "url", "actor"),
@@ -281,6 +337,15 @@ func (t *ToolSet) httpProbe() actool.CoreTool {
 				HostOverride string `json:"host_override"`
 				InsecureTLS  bool   `json:"insecure_tls"`
 				CookieJar    bool   `json:"cookie_jar"`
+				// ★ body_base64：二进制请求体（文件上传漏洞必需）。
+				//   原来 Body 是 string，只能发文本 —— multipart 里的二进制分片、
+				//   protobuf、序列化 payload 全都发不出去。
+				//   给了 body_base64 就用它（优先于 body）。
+				BodyBase64 string `json:"body_base64"`
+				// ★ body_offset：从响应体的这个字节位置开始取（配合 body_excerpt 分页）。
+				//   原来只返回前 4000 字节，长 JSON / 长 HTML 后面的内容模型永远看不到；
+				//   遇到"关键信息在很后面"的情况只能靠猜。有了 offset 就能翻页取全。
+				BodyOffset int `json:"body_offset"`
 			}
 			_ = json.Unmarshal(in, &a)
 			if strings.TrimSpace(a.URL) == "" {
@@ -345,8 +410,19 @@ func (t *ToolSet) httpProbe() actool.CoreTool {
 			}
 
 			// ── 实际发请求 ──
+			//
+			// ★ body_base64 优先于 body：文件上传 / protobuf / 序列化 payload
+			//   都是二进制，原来只能发 string 等于这类漏洞根本测不了。
 			var bodyRd io.Reader
-			if a.Body != "" {
+			bodyLen := len(a.Body)
+			if b64 := strings.TrimSpace(a.BodyBase64); b64 != "" {
+				dec, derr := base64.StdEncoding.DecodeString(b64)
+				if derr != nil {
+					return actool.Errorf(fmt.Sprintf("body_base64 解码失败：%v", derr)), nil
+				}
+				bodyRd = bytes.NewReader(dec)
+				bodyLen = len(dec)
+			} else if a.Body != "" {
 				bodyRd = strings.NewReader(a.Body)
 			}
 			reqCtx, cancel := context.WithTimeout(ctx, time.Duration(a.TimeoutSec)*time.Second)
@@ -408,7 +484,7 @@ func (t *ToolSet) httpProbe() actool.CoreTool {
 				pl := observationPayload{
 					Channel: "http", ActualURL: a.URL, Target: parseHost(a.URL),
 					Actor: a.Actor, Object: a.Object, Purpose: a.Purpose,
-					ReqMethod: method, ReqHeaders: redactHeaders(a.Headers), ReqBodyLen: len(a.Body),
+					ReqMethod: method, ReqHeaders: redactHeaders(a.Headers), ReqBodyLen: bodyLen,
 					ElapsedMS: elapsed, At: time.Now().UTC().Format(time.RFC3339),
 					ModelNote: a.Note,
 					Summary:   fmt.Sprintf("HTTP %s %s → 传输失败(%v) actor=%s", method, a.URL, err, a.Actor),
@@ -518,8 +594,13 @@ func (t *ToolSet) httpProbe() actool.CoreTool {
 				"body_len":       len(raw),
 				// ★ 2026-10-17：800 → 4000。800 字节大约只够看到 <head>，
 				//   接口返回的 JSON 稍微长一点就全被截掉，模型只能靠猜。
-				"body_excerpt": excerpt(raw, 4000),
-				"resp_headers": respHeaders,
+				// ★ body_offset 分页：默认从头取 4000 字节；
+				//   响应更长时 body_next_offset 给出下一页起点（-1=已到末尾）。
+				"body_excerpt":     excerptAt(raw, a.BodyOffset, 4000),
+				"body_offset":      a.BodyOffset,
+				"body_next_offset": nextBodyOffset(a.BodyOffset, len(raw)),
+				"body_end":         a.BodyOffset+4000 >= len(raw),
+				"resp_headers":     respHeaders,
 				"context": map[string]any{
 					"target": pl.Target, "actor": pl.Actor, "object": pl.Object, "purpose": pl.Purpose,
 				},
