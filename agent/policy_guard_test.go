@@ -142,18 +142,20 @@ func TestPolicyIntranetDenied(t *testing.T) {
 		scopeRule{kind: "cidr", ipnet: mustCIDR("172.18.0.0/16"), raw: "172.18.0.0/16", source: "agent"},
 	)
 
-	// ★ 即使显式声明进 scope，私有网段仍被规则①硬禁
+	// ★ 2026-10-17「纵向可以、横向不行」：
+	//   这里声明的是 10.0.0.0/8 与 172.18.0.0/16 —— 都【过宽】（< /24）。
+	//   ⇒ 按新规则不放行：靠一句大网段声明去横扫内网，判为疑似横向。
 	for _, h := range []string{"10.1.2.3", "172.18.0.5", "192.168.1.1"} {
 		v := g.checkHost(h)
 		if v.Allowed {
-			t.Errorf("%s 属私有网段，规则①应硬禁（即使已声明进 scope），实际放行", h)
+			t.Errorf("%s 只被宽网段覆盖或无声明，应判疑似横向，实际放行", h)
 			continue
 		}
-		if v.Layer != "intranet_denied" {
-			t.Errorf("%s 拒绝层级应为 intranet_denied，实际 %s", h, v.Layer)
+		if v.Layer != "lateral_denied" {
+			t.Errorf("%s 拒绝层级应为 lateral_denied，实际 %s", h, v.Layer)
 		}
 	}
-	t.Logf("✓ 规则①：私有网段硬禁，即使显式声明进 scope 也不放行")
+	t.Logf("✓ 宽网段声明（/8、/16）不放行：判疑似横向，防止一句声明横扫内网")
 }
 
 func TestPolicyIntranetAllowlist(t *testing.T) {

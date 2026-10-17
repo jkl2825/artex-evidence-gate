@@ -78,15 +78,16 @@ func TestScopeUndeclaredAllowsPublicButWarns(t *testing.T) {
 	if v.Layer != "no_scope_declared" {
 		t.Errorf("层级应为 no_scope_declared，实际 %s", v.Layer)
 	}
-	// ★ 但私有网段【不再因为"未声明"就放行】（2026-10-17 规则①改为硬禁）：
-	//   无声明只影响"公网目标是否 fail-closed"，不影响内网闸 —— 内网闸与声明无关。
+	// ★ 2026-10-17「纵向可以、横向不行」：
+	//   内网目标是否放行，看【有没有在 task_scope 里窄声明】，不是看"声明过没有"。
+	//   这里 g 没有任何内网规则 ⇒ 172.18.0.5 属可疑横向 ⇒ lateral_denied。
 	v2 := g.checkHost("172.18.0.5")
 	if v2.Allowed {
-		t.Errorf("私有网段应被规则①硬禁（与是否声明无关），实际放行")
-	} else if v2.Layer != "intranet_denied" {
-		t.Errorf("层级应为 intranet_denied，实际 %s", v2.Layer)
+		t.Errorf("未声明内网目标应判疑似横向，实际放行")
+	} else if v2.Layer != "lateral_denied" {
+		t.Errorf("层级应为 lateral_denied，实际 %s", v2.Layer)
 	}
-	t.Logf("✓ 未声明范围：公网放行并标 no_scope_declared；私有网段仍被规则①硬禁")
+	t.Logf("✓ 未声明范围：公网放行并标 no_scope_declared；未声明的内网目标判疑似横向")
 }
 
 // ── 已声明范围：fail-closed ─────────────────────────────────────────────
@@ -117,19 +118,21 @@ func TestScopeDeclaredFailClosed(t *testing.T) {
 		}
 	}
 
-	// ★ 语义变化（2026-10-17 按用户给定测试规则）：私有网段从"需在 scope 中声明"
-	//   改为"硬禁，除非落在 ARTEX_INTRANET_ALLOW 白名单"。理由：声明只能证明
-	//   "我知道我在打内网"，不能证明"被授权打内网"；规则①明确禁止内网渗透。
-	// ⇒ 因此下面两条即使【显式声明进 scope】也必须被拒。
+	// ★ 2026-10-17「纵向可以、横向不行」：
+	//   内网目标在 task_scope 里【窄声明】（IPv4 ≥/24）⇒ 放行（纵向）；
+	//   未声明，或只声明了过宽的网段 ⇒ 拒绝（视为横向扩散）。
+	//
+	//   这里声明的 172.18.0.0/16 是【宽】的（/16 < /24）⇒ 按新规则仍被拒。
+	//   ⇒ 这正是「不能靠一句 10.0.0.0/8 就横扫内网」的闸。
 	if v := g.checkHost("172.18.0.5"); v.Allowed {
-		t.Errorf("172.18.0.5 属私有网段，规则①应硬禁（即使已声明进 scope），实际放行")
-	} else if v.Layer != "intranet_denied" {
-		t.Errorf("层级应为 intranet_denied，实际 %s", v.Layer)
+		t.Errorf("172.18.0.5 只被 /16 宽声明覆盖，应判疑似横向，实际放行")
+	} else if v.Layer != "lateral_denied" {
+		t.Errorf("层级应为 lateral_denied，实际 %s", v.Layer)
 	}
 	if v := g.checkHost("10.1.2.3"); v.Allowed {
-		t.Errorf("10.1.2.3 属私有网段，规则①应硬禁，实际允许")
-	} else if v.Layer != "intranet_denied" {
-		t.Errorf("层级应为 intranet_denied，实际 %s", v.Layer)
+		t.Errorf("10.1.2.3 无任何声明，应判疑似横向，实际允许")
+	} else if v.Layer != "lateral_denied" {
+		t.Errorf("层级应为 lateral_denied，实际 %s", v.Layer)
 	}
 	t.Logf("✓ 已声明范围：子域放行、伪子域拒绝、私有网段硬禁（规则①）")
 }
@@ -206,4 +209,119 @@ func TestScopeHostNormalization(t *testing.T) {
 		}
 	}
 	t.Logf("✓ host 归一化 %d 例通过", len(cases))
+}
+
+// ── 2026-10-17「纵向可以、横向不行」─────────────────────────────────────
+//
+// 判据：内网目标在 task_scope 里【窄声明】(IPv4 ≥/24) ⇒ 放行（纵向测试）；
+//       未声明或只被宽网段覆盖 ⇒ 拒绝（疑似横向扩散）。
+
+func TestIntranetVerticalAllowedByNarrowDeclare(t *testing.T) {
+	t.Setenv("ARTEX_INTRANET_ALLOW", "")
+	resetIntranetAllowlistForTest()
+
+	g := guardWith(true,
+		// 单机声明（/32）
+		scopeRule{kind: "ip", ipnet: mustCIDR("10.1.2.3/32"), raw: "10.1.2.3", source: "agent"},
+		// /24 小网段（合规边界值）
+		scopeRule{kind: "cidr", ipnet: mustCIDR("192.168.5.0/24"), raw: "192.168.5.0/24", source: "agent"},
+	)
+
+	allow := []string{"10.1.2.3", "192.168.5.10", "192.168.5.255"}
+	for _, h := range allow {
+		v := g.checkHost(h)
+		if !v.Allowed {
+			t.Errorf("%s 已被窄声明覆盖，应放行（纵向），实际被拒：%s / %s", h, v.Layer, v.Rule)
+			continue
+		}
+		if v.Layer != "intranet_scope_declared" {
+			t.Errorf("%s 放行层级应为 intranet_scope_declared，实际 %s", h, v.Layer)
+		}
+	}
+	t.Logf("✓ 窄声明（/32、/24）的内网目标放行 —— 纵向测试")
+
+	// 同一网段里没声明的邻居，仍要拒
+	if v := g.checkHost("10.1.2.4"); v.Allowed {
+		t.Errorf("10.1.2.4 与 10.1.2.3 同段但未声明，应判疑似横向，实际放行")
+	} else if v.Layer != "lateral_denied" {
+		t.Errorf("10.1.2.4 层级应为 lateral_denied，实际 %s", v.Layer)
+	}
+	t.Logf("✓ 同网段未声明的邻居仍被拒 —— 横向测试")
+}
+
+func TestIntranetWideDeclareStillDenied(t *testing.T) {
+	t.Setenv("ARTEX_INTRANET_ALLOW", "")
+	resetIntranetAllowlistForTest()
+
+	// 全是宽网段声明
+	g := guardWith(true,
+		scopeRule{kind: "cidr", ipnet: mustCIDR("10.0.0.0/8"), raw: "10.0.0.0/8", source: "agent"},
+		scopeRule{kind: "cidr", ipnet: mustCIDR("172.16.0.0/12"), raw: "172.16.0.0/12", source: "agent"},
+		scopeRule{kind: "cidr", ipnet: mustCIDR("192.168.0.0/16"), raw: "192.168.0.0/16", source: "agent"},
+	)
+	for _, h := range []string{"10.1.2.3", "172.20.0.5", "192.168.1.1"} {
+		v := g.checkHost(h)
+		if v.Allowed {
+			t.Errorf("%s 只被宽网段（</24）覆盖，应判疑似横向，实际放行", h)
+			continue
+		}
+		if v.Layer != "lateral_denied" {
+			t.Errorf("%s 层级应为 lateral_denied，实际 %s", h, v.Layer)
+		}
+	}
+	t.Logf("✓ /8 /12 /16 宽声明不放行 —— 防「一句声明横扫内网」")
+}
+
+func TestIntranetAllowlistStillWorks(t *testing.T) {
+	t.Setenv("ARTEX_INTRANET_ALLOW", "172.18.0.0/16")
+	resetIntranetAllowlistForTest()
+
+	// 没有 task_scope 声明，但部署方白名单覆盖
+	g := guardWith(true)
+	if v := g.checkHost("172.18.0.5"); !v.Allowed {
+		t.Errorf("172.18.0.5 在 ARTEX_INTRANET_ALLOW 内，应放行，实际被拒：%s / %s", v.Layer, v.Rule)
+	} else if v.Layer != "intranet_allowlisted" {
+		t.Errorf("层级应为 intranet_allowlisted，实际 %s", v.Layer)
+	}
+	// 白名单外的内网仍拒
+	if v := g.checkHost("10.9.9.9"); v.Allowed {
+		t.Errorf("10.9.9.9 既无声明也不在白名单，应拒，实际放行")
+	}
+	t.Logf("✓ 部署方白名单通道仍然有效")
+}
+
+func TestAbsolutlyDeniedBeatsNarrowDeclare(t *testing.T) {
+	t.Setenv("ARTEX_INTRANET_ALLOW", "")
+	resetIntranetAllowlistForTest()
+
+	// 即使窄声明了云元数据地址，也必须被第一道闸拦
+	g := guardWith(true,
+		scopeRule{kind: "ip", ipnet: mustCIDR("169.254.169.254/32"), raw: "169.254.169.254", source: "agent"},
+	)
+	if v := g.checkHost("169.254.169.254"); v.Allowed {
+		t.Errorf("云元数据地址即使被窄声明也必须拦，实际放行")
+	} else if v.Layer != "absolutely_denied" {
+		t.Errorf("层级应为 absolutely_denied，实际 %s", v.Layer)
+	}
+	t.Logf("✓ 绝对禁止段不受声明影响")
+}
+
+func TestNarrowEnough(t *testing.T) {
+	cases := []struct {
+		cidr string
+		want bool
+	}{
+		{"10.1.2.3/32", true},
+		{"192.168.5.0/24", true},
+		{"192.168.5.0/25", true},
+		{"10.0.0.0/16", false},
+		{"10.0.0.0/8", false},
+		{"172.16.0.0/12", false},
+	}
+	for _, c := range cases {
+		if got := narrowEnough(mustCIDR(c.cidr)); got != c.want {
+			t.Errorf("narrowEnough(%s) = %v, want %v", c.cidr, got, c.want)
+		}
+	}
+	t.Logf("✓ 宽窄判定 %d 例通过", len(cases))
 }

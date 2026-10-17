@@ -436,6 +436,44 @@ func invalidateDNSCache() {
 	dnsCacheMu.Unlock()
 }
 
+// narrowEnough 判断一条内网 CIDR 规则是否"够窄"。
+//
+// ★ 2026-10-17「纵向可以、横向不行」：
+//
+//	内网从「白名单制」改成「声明制」—— 在 task_scope 里声明的内网目标可以打。
+//	但如果不限宽度，把 10.0.0.0/8 声明一次就等于允许横扫整个内网。
+//	⇒ 内网声明必须够窄：IPv4 掩码 ≥ /24（≤256 地址），IPv6 ≥ /120。
+//	  公网 CIDR 不受此限（那是正常资产测绘）。
+func narrowEnough(n *net.IPNet) bool {
+	if n == nil {
+		return false
+	}
+	ones, bits := n.Mask.Size()
+	switch bits {
+	case 32:
+		return ones >= 24
+	case 128:
+		return ones >= 120
+	}
+	return false
+}
+
+// declaredIntranetRule 在已声明的规则里找一条覆盖 ip、且宽度合规的内网规则。
+// 找到 ⇒ 这是【用户显式授权的目标】，属于纵向测试；找不到 ⇒ 视为横向扩散。
+func (g *scopeGuard) declaredIntranetRule(ip net.IP) (scopeRule, bool) {
+	for _, r := range g.rules {
+		if r.ipnet == nil || !r.ipnet.Contains(ip) {
+			continue
+		}
+		if narrowEnough(r.ipnet) {
+			return r, true
+		}
+		// 命中但太宽：不放行（并让调用方知道存在过宽的声明）
+		return r, false
+	}
+	return scopeRule{}, false
+}
+
 // checkHost 判定一个 host 是否在授权边界内。
 func (g *scopeGuard) checkHost(host string) scopeVerdict {
 	host = scopeNormHost(host)
@@ -552,8 +590,29 @@ func (g *scopeGuard) checkHost(host string) scopeVerdict {
 	//   就会先命中 scope 分支而放行 —— "规则①禁止内网渗透" 就形同虚设。
 	//   这条是单测 TestPolicyIntranetDenied 抓出来的真实顺序 bug。
 
-	// ★ 规则①：内网硬禁。私有网段一律拒绝，只有 ARTEX_INTRANET_ALLOW 白名单里的段放行。
+	// ★ 规则①（2026-10-17 改版）：内网从「白名单制」改为「声明制」。
+	//
+	//   判据：纵向 vs 横向
+	//     纵向（允许）= 对 task_scope 里【显式声明过】的内网目标打深
+	//     横向（禁止）= 打没声明过的内网地址（通常是从目标响应里发现的新邻居）
+	//
+	//   顺序：
+	//     ① task_scope 里有覆盖它的窄规则（IPv4 ≥/24）⇒ 放行（纵向）
+	//     ② ARTEX_INTRANET_ALLOW 白名单 ⇒ 放行（部署方授权）
+	//     ③ 都没有 ⇒ 拒绝，理由写明「疑似横向」
+	//
+	//   ★ 为什么保留白名单这一层：存量任务可能没走 add_task_scope，
+	//     部署方需要一条不经模型的通道来授权内网。
 	if n, hit := ipInAny(ip, privateNets); hit {
+		// ① 显式声明过 ⇒ 纵向
+		if r, ok := g.declaredIntranetRule(ip); ok {
+			v.Allowed = true
+			v.Layer = "intranet_scope_declared"
+			v.Rule = fmt.Sprintf("%s 属私有网段 %s，已被 task_scope 显式声明（%s=%s，source=%s）"+
+				"—— 纵向测试放行", host, n.String(), r.kind, r.raw, r.source)
+			return v
+		}
+		// ② 部署方白名单 ⇒ 放行
 		if allowNet, ok := intranetAllowed(ip); ok {
 			v.Allowed = true
 			v.Layer = "intranet_allowlisted"
@@ -561,10 +620,14 @@ func (g *scopeGuard) checkHost(host string) scopeVerdict {
 				host, n.String(), allowNet.String())
 			return v
 		}
-		v.Layer = "intranet_denied"
-		v.Rule = fmt.Sprintf("测试规则①「禁止进行内网渗透行为」：%s 属私有网段 %s。"+
-			"内网目标默认禁止；若这是获授权的内网测试环境，需由部署方把该网段加入 "+
-			"ARTEX_INTRANET_ALLOW（模型无法自行打开）", host, n.String())
+		// ③ 都没声明 ⇒ 视为横向扩散
+		v.Layer = "lateral_denied"
+		v.Rule = fmt.Sprintf("★ 疑似横向扩散，已拦下：%s 属私有网段 %s，但【未在本任务的 task_scope 里声明】。\n"+
+			"  本平台允许「纵向」（对已授权目标打深，含提权/读文件），"+
+			"禁止「横向」（从目标扩散到未授权的内网邻居）。\n"+
+			"  若 %s 确实是本任务授权范围内的目标，请用 add_task_scope 显式声明"+
+			"（kind=ip，或 kind=cidr 且掩码 ≥/24）；"+
+			"整段内网的批量授权需由部署方设置 ARTEX_INTRANET_ALLOW。", host, n.String(), host)
 		return v
 	}
 
