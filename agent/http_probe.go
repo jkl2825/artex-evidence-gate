@@ -97,9 +97,22 @@ type observationPayload struct {
 	// 从而给出一个假的 true。加这个字段，让谓词层能明确判 false。
 	CompareInvalid bool   `json:"compare_invalid,omitempty"`
 	CompareNote    string `json:"compare_note,omitempty"`
-	Extracted   map[string]string `json:"extracted,omitempty"`  // 动态依赖提取结果
-	ModelNote   string            `json:"model_note,omitempty"` // 模型自述（仅供参考，非唯一来源）
-	Summary     string            `json:"summary"`
+
+	// InitialURL / FinalURL：初始请求目标与最终响应来源。
+	// ★ 重定向后 resp 是最终响应，原实现把 status/body 配给了【初始】URL
+	//   ⇒ /protected → /login 会被记成"在 /protected 上拿到 200"，制造假前提。
+	InitialURL string `json:"initial_url,omitempty"`
+	FinalURL   string `json:"final_url,omitempty"`
+
+	// Truncated / ReadError / BodyCap：响应是否被截断或读取出错。
+	// ★ io.LimitReader 静默截断 + ReadAll 错误被丢弃，会让"前 1MiB 相同、后面不同"
+	//   的两条响应被判相同；缺失的证明不能被当作相等。
+	Truncated bool              `json:"truncated,omitempty"`
+	ReadError string            `json:"read_error,omitempty"`
+	BodyCap   int               `json:"body_cap_bytes,omitempty"`
+	Extracted map[string]string `json:"extracted,omitempty"`  // 动态依赖提取结果
+	ModelNote string            `json:"model_note,omitempty"` // 模型自述（仅供参考，非唯一来源）
+	Summary   string            `json:"summary"`
 }
 
 // extractRule 动态依赖提取规则。
@@ -367,15 +380,27 @@ func (t *ToolSet) httpProbe() actool.CoreTool {
 				})
 			}
 			defer resp.Body.Close()
-			raw, _ := io.ReadAll(io.LimitReader(resp.Body, 1<<20)) // 上限 1MiB
+			// 多读 1 字节才能区分"正好 1MiB"与"被截断"
+			const maxBody = 1 << 20
+			rawAll, readErr := io.ReadAll(io.LimitReader(resp.Body, maxBody+1))
+			truncated := len(rawAll) > maxBody
+			if truncated {
+				rawAll = rawAll[:maxBody]
+			}
+			raw := rawAll
 			sum := sha256.Sum256(raw)
 			respHeaders := map[string]string{}
 			for k, v := range resp.Header {
 				respHeaders[k] = strings.Join(v, ", ")
 			}
 
+			finalURL := a.URL
+			if resp.Request != nil && resp.Request.URL != nil {
+				finalURL = resp.Request.URL.String()
+			}
 			pl := observationPayload{
-				Channel: "http", ActualURL: a.URL, Target: parseHost(a.URL),
+				Channel: "http", ActualURL: finalURL, Target: parseHost(finalURL),
+				InitialURL: a.URL, FinalURL: finalURL,
 				Actor: a.Actor, Object: a.Object, Purpose: a.Purpose,
 				ReqMethod: method, ReqHeaders: redactHeaders(a.Headers), ReqBodyLen: len(a.Body),
 				RespStatus: resp.StatusCode, RespHeaders: respHeaders,
@@ -383,9 +408,22 @@ func (t *ToolSet) httpProbe() actool.CoreTool {
 				ElapsedMS: elapsed, At: time.Now().UTC().Format(time.RFC3339),
 				Extracted: runExtract(a.Extract, respHeaders, string(raw)),
 				ModelNote: a.Note,
+				Truncated: truncated, BodyCap: maxBody,
+			}
+			if readErr != nil {
+				pl.ReadError = readErr.Error()
 			}
 			pl.Summary = fmt.Sprintf("HTTP %s %s → %d (%d bytes, %dms) actor=%s object=%s",
 				method, a.URL, resp.StatusCode, len(raw), elapsed, a.Actor, orDash(a.Object))
+			if finalURL != a.URL {
+				pl.Summary += " [redirected → " + finalURL + "]"
+			}
+			if truncated {
+				pl.Summary += fmt.Sprintf(" [TRUNCATED at %d bytes]", maxBody)
+			}
+			if readErr != nil {
+				pl.Summary += " [READ ERROR]"
+			}
 
 			// ── 对照关联：程序自动算可区分性（这是 session.valid / object.exists 的语义依据）──
 			if a.CompareWith > 0 {
