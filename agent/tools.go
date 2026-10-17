@@ -430,6 +430,61 @@ func (t *ToolSet) graphOverviewData() map[string]any {
 		}
 	}
 	out["running_intents"] = compactIntents(running, parentsOf, yieldsOf)
+
+	// ★ 战线（2026-10-17）：让 planner 每轮都看到「当前主攻哪条线、挖到什么程度」。
+	// 没有这块，它就只会从全局问"还有什么新方向"，自然铺开而不深入。
+	if active, err := t.ts.ActiveThread(); err == nil {
+		if active == nil {
+			// 区分"从没开过"与"全收口了"——后者必须开新线才能继续派意图
+			prev, _ := t.ts.ListThreads("", 1)
+			if len(prev) == 0 {
+				out["active_thread"] = nil
+				out["thread_hint"] = "本任务还没有任何战线。派意图前先 open_thread 开一条。" +
+					"如果没有 user 指定的专注方向，选一条最有希望打穿的路先开。"
+			} else {
+				out["active_thread"] = nil
+				out["thread_hint"] = "所有战线都已收口。要继续推进必须先 open_thread 开一条新战线" +
+					"（写明打什么 + 什么算挖透），不能在没有主线的情况下直接 add_intent。"
+			}
+		} else {
+			var p db.ThreadPayload
+			_ = json.Unmarshal(active.Payload, &p)
+			at := map[string]any{
+				"id": active.ID, "state": active.State,
+				"summary": p.Summary, "done_when": p.DoneWhen,
+			}
+			if p.Entry != "" {
+				at["entry"] = p.Entry
+			}
+			if st, serr := t.ts.ThreadStatsOf(active.ID); serr == nil {
+				at["stats"] = st
+				// 空转提示：有意图但一条观察都没有 ⇒ 只派了活没人真打
+				if st.Intents > 0 && st.Observations == 0 {
+					at["warning"] = "这条线已派了 " + strconv.Itoa(st.Intents) +
+						" 条意图但还没有任何结构化观察 —— 确认 worker 真的在打，而不是意图空转"
+				}
+			}
+			out["active_thread"] = at
+			out["thread_hint"] = "所有 add_intent 都会自动挂到这条线。" +
+				"done_when 满足了就用 close_thread 收线（写明依据），再开下一条；" +
+				"不要在它没挖完时去想别的方向。"
+		}
+	}
+	// 全部战线概览（数量少，直接给）
+	if all, err := t.ts.ListThreads("", 30); err == nil && len(all) > 0 {
+		sum := make([]map[string]any, 0, len(all))
+		for _, n := range all {
+			var p db.ThreadPayload
+			_ = json.Unmarshal(n.Payload, &p)
+			row := map[string]any{"id": n.ID, "state": n.State, "summary": p.Summary}
+			if st, serr := t.ts.ThreadStatsOf(n.ID); serr == nil {
+				row["stats"] = st
+			}
+			sum = append(sum, row)
+		}
+		out["threads"] = sum
+		out["threads_total"] = len(all)
+	}
 	// done_intents_total：已结束意图（done/blocked/exhausted）总数，与 recent_done_intents
 	// 平行命名——后者只是它的最新窗口截断视图。两键并排即自描述："看到的是 N/总数"，
 	// 让 planner 去重时别把"没显示"当成"没派过"，无需在提示词里另行解释。
@@ -1028,6 +1083,10 @@ type intentItem struct {
 	AssetIDs  []json.RawMessage `json:"asset_ids"`
 	ParentIDs []json.RawMessage `json:"parent_ids"`
 	Priority  int               `json:"priority"`
+	// ★ ThreadID（2026-10-17）：这条意图归属哪条战线。
+	//   有 active thread 时必填（或留 0 由服务端自动挂到 active）；
+	//   指向非 active 的 thread 会被拒绝 —— 那是"另开一条线"，必须先 open_thread。
+	ThreadID int64 `json:"thread_id"`
 }
 
 // addOneIntent 创建一条意图节点并连上游血缘，返回 id。
@@ -1049,6 +1108,42 @@ func (t *ToolSet) addOneIntent(it intentItem) (int64, error) {
 			return 0, fmt.Errorf("parent_id %d 是 %q 节点，不能作为意图锚点：意图只能锚在已确认的【事实(fact)/发现(finding)】上，不能挂在意图/目标/提示上；顶层全新方向请留空 parent_ids", pidv, n.Kind)
 		}
 	}
+	// ★ 战线归属（2026-10-17）：只有 planner 走这条硬约束。
+	//
+	// 动机：planner 原本每次唤醒都从全局问"还有什么新方向"，没有结构约束
+	// "当前主攻哪条线、挖完没有" ⇒ 必然铺开而不深入（实测 21 分钟派 22 条）。
+	// 这里把"挖完才换"变成代码约束，不靠提示词自觉。
+	//
+	// 判定分三档（对老任务/人工直投保持兼容）：
+	//   ① 已有 active thread  → 意图必须挂在它下面（thread_id 留 0 则自动挂）
+	//   ② 有过 thread 但都收口 → 必须先 open_thread 才能派（禁止无主线铺开）
+	//   ③ 从来没有 thread      → 放行（老任务 / 非 planner 场景），仅提示
+	threadID := int64(0)
+	if t.worker == "planner" {
+		active, aerr := t.ts.ActiveThread()
+		if aerr != nil {
+			return 0, fmt.Errorf("查询当前战线失败：%w", aerr)
+		}
+		switch {
+		case active != nil:
+			if it.ThreadID != 0 && it.ThreadID != active.ID {
+				return 0, fmt.Errorf("thread_id=%d 不是当前 active 战线（active=%d）。"+
+					"想开新方向必须先 close_thread 收掉当前战线，再 open_thread 开新的；"+
+					"不能在旧线还没挖完时就另开一条", it.ThreadID, active.ID)
+			}
+			threadID = active.ID
+		default:
+			// 没有 active：看历史有没有过 thread
+			if prev, _ := t.ts.ListThreads("", 1); len(prev) > 0 {
+				return 0, fmt.Errorf("当前没有 active 战线（历史 %d 条都已收口）。"+
+					"派意图前必须先用 open_thread 开一条新战线——"+
+					"写明这条线要打什么(summary)、什么算挖透(done_when)。"+
+					"不允许在没有主线的情况下铺开意图", len(prev))
+			}
+			// ③ 从来没有 thread：放行（兼容），但在返回里提示
+		}
+	}
+
 	priority := it.Priority
 	if priority == 0 {
 		priority = 5
@@ -1077,6 +1172,10 @@ func (t *ToolSet) addOneIntent(it intentItem) (int64, error) {
 	if err != nil {
 		return 0, err
 	}
+	// ★ 归属：thread --spawns--> intent（统计与闭环判定都靠这条边）
+	if threadID != 0 {
+		_ = t.ts.Link(threadID, db.RelSpawns, id)
+	}
 	// upstream lineage: link each (validated) fact/finding parent → this intent, so
 	// "multiple facts combine into one new intent" is expressible.
 	for _, parent := range parents {
@@ -1102,6 +1201,9 @@ func (t *ToolSet) addIntent() actool.CoreTool {
 			"asset_ids":  map[string]any{"type": "array", "items": map[string]any{"type": "integer"}, "description": "本方向要测试/攻击的【目标资产 id】（**尽量传**，0/1/多个；是 list_assets 返回的资产 id，不是探索节点 id）：这条探索方向针对哪些资产（站点/接口/参数/主机等）。只要方向围绕某些具体资产就务必传上——它是「这条探索打哪些目标」的结构化标记，用于覆盖去重、把意图连入资产链路。仅当纯全局侦察、确实没有具体目标资产时才留空。"},
 			"parent_ids": map[string]any{"type": "array", "items": map[string]any{"type": "integer"}, "description": "上游锚点 id（可选，0/1/多个）：本方向由哪些【已确认的事实(fact)/发现(finding)】综合得出。**只能填已存在的 fact/finding 节点 id,不能填意图/目标/提示**——意图必须锚在已确认知识上,发现驱动而非凭空规划。多个事实共同产生一个新意图就传多个;顶层全新侦察方向请留空（会自动挂到任务起点 origin fact）。"},
 			"priority":   intp("优先级 0-10，默认5"),
+			"thread_id": idp("★ 归属哪条战线（open_thread 返回的 id）。" +
+				"有 active 战线时留空会自动挂到它；填了非 active 的 id 会被拒绝" +
+				"—— 想开新方向必须先 close_thread 再 open_thread"),
 		}),
 		func(_ context.Context, in json.RawMessage) (actool.Result, error) {
 			var a struct {
@@ -2060,6 +2162,9 @@ func (t *ToolSet) PlannerTools() []actool.CoreTool {
 		t.graphOverview(), t.listFindings(), t.listFacts(), t.nodeDetail(),
 		// cold-digest §6.1: restore folded cold nodes (digest body → members → detail).
 		t.expandDigest(),
+		// ★ 战线（2026-10-17）：先开线，再派意图；挖透才收线、才能开下一条。
+		// 这是「挖完才换」的结构保证 —— addIntent 会拒绝没有 thread 归属的派发。
+		t.openThread(), t.closeThread(), t.listThreadsTool(),
 		t.getWorkerOutput(), t.getWorkerTrace(), t.searchAllWorkerTraces(), t.listGoals(), t.addIntent(), t.proveGoal(), t.goalMet(),
 		t.killWorkTool(), t.steerWorkTool(),
 		// report_finding：规划态势研判时若自身已确证漏洞，可直接登记（与 worker 同工具）。

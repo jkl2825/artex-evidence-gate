@@ -30,13 +30,54 @@ func (s *Server) launchTask(t *Task, seedText string, seedFirstIntent bool) {
 		return
 	}
 	s.seed(t, seedText)
+	// ★ 自动开一条初始战线（2026-10-17）。
+	//
+	// 为什么必须在这里做：thread 是「同一时刻只打一条方向」的结构保证，
+	// 但如果完全依赖 planner 主动 open_thread，短任务里 planner 常常只跑一轮
+	// 就判 goal 达成（实测 task45：79 秒结束、planner 只 1 轮、从没开线）。
+	// ⇒ 后果是闭环约束形同虚设，长任务上又会退回到"到处铺开"。
+	// 所以任务一创建就给它一条明确的线，后续所有意图都挂在它下面；
+	// 这条线挖透了 close_thread，才允许开下一条。
+	threadID := s.openInitialThread(t)
 	if seedFirstIntent {
-		s.seedFirstIntent(t)
+		s.seedFirstIntent(t, threadID)
 	}
 	s.engine.decInflight(t.ID)
 	if _, err := s.admitTask(t, "bootstrap"); err != nil {
 		log.Printf("[concurrency] task %s 启动失败: %v", t.ID, err)
 	}
+}
+
+// openInitialThread 给新任务开第一条战线，返回其 id（失败返回 0，不阻塞任务）。
+//
+// done_when 刻意写成"已确认至少一个可复现漏洞，或已穷尽主要攻击面"这种可判定的形态：
+// 太细（"侦察完成"）会导致频繁换线；太粗（"达成任务目标"）等于整任务一条线，闭环失效。
+func (s *Server) openInitialThread(t *Task) int64 {
+	if t == nil || t.Store == nil {
+		return 0
+	}
+	// 已经有线就别重复开（幂等：重启/重入时安全）
+	if active, err := t.Store.ActiveThread(); err == nil && active != nil {
+		return active.ID
+	}
+	summary := fmt.Sprintf("主攻：%s", strings.TrimSpace(t.Name))
+	if g := strings.TrimSpace(t.Goal); g != "" {
+		summary = fmt.Sprintf("主攻：%s", g)
+	}
+	payload := map[string]any{
+		"summary": summary,
+		"done_when": "已确认至少一个可复现的漏洞（有 observation 证据），" +
+			"或已把该目标的主要攻击面（接口/参数/上传/认证）逐个测过并记录结论；" +
+			"两种情况下都要写明依据再 close_thread",
+		"entry": strings.TrimSpace(t.Description),
+	}
+	id, err := t.Store.CreateThread(payload)
+	if err != nil {
+		log.Printf("[thread] task %s: 开初始战线失败（不影响任务）: %v", t.ID, err)
+		return 0
+	}
+	log.Printf("[thread] task %s: 初始战线 #%d", t.ID, id)
+	return id
 }
 
 func (s *Server) startTaskEngine(t *Task) {

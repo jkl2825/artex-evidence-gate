@@ -124,12 +124,22 @@ func (d *DB) mergeMissingToolProps(key string, codeSchema json.RawMessage) error
 	if err != nil {
 		return nil
 	}
-	rb, err := json.Marshal(curReq)
-	if err != nil {
-		return nil
-	}
 	cur["properties"] = pb
-	cur["required"] = rb
+	// ★ required 只在【非空】时写回。
+	//   踩过：curReq 为 nil 时 json.Marshal(nil) 得到字面量 null，
+	//   写回 schema 后变成 "required": null —— 网关直接拒整个请求
+	//   （503 no_healthy_account / code 11129 invalid function call parameters），
+	//   而且只有 add_intent（它本来就不带 required）会中招，排查极其困难。
+	//   原 schema 里根本没有 required 字段，那就保持没有。
+	if len(curReq) > 0 {
+		rb, merr := json.Marshal(curReq)
+		if merr != nil {
+			return nil
+		}
+		cur["required"] = rb
+	} else {
+		delete(cur, "required")
+	}
 	merged, err := json.Marshal(cur)
 	if err != nil {
 		return nil

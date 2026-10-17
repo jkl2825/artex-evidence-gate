@@ -181,7 +181,7 @@ CREATE TABLE IF NOT EXISTS exploration_nodes (
     created_at     TIMESTAMPTZ NOT NULL DEFAULT now(),
     updated_at     TIMESTAMPTZ NOT NULL DEFAULT now(),
     completed_at   TIMESTAMPTZ,
-    CONSTRAINT ck_node_kind CHECK (kind IN ('begin','goal','intent','fact','finding','hint','digest','validity_audit','validity_gate','baseline','observation')),
+    CONSTRAINT ck_node_kind CHECK (kind IN ('begin','goal','intent','fact','finding','hint','digest','validity_audit','validity_gate','baseline','observation','thread')),
     CONSTRAINT ck_node_state CHECK (
         (kind='begin'   AND state IN ('open')) OR
         (kind='intent'  AND state IN ('open','running','paused','done','blocked','exhausted','stopped','deleted')) OR
@@ -193,7 +193,8 @@ CREATE TABLE IF NOT EXISTS exploration_nodes (
         (kind='validity_audit' AND state IN ('confirmed','dismissed')) OR
         (kind='validity_gate'  AND state IN ('confirmed','dismissed')) OR
         (kind='baseline'       AND state IN ('confirmed','dismissed')) OR
-        (kind='observation'    AND state IN ('confirmed','dismissed'))
+        (kind='observation'    AND state IN ('confirmed','dismissed')) OR
+        (kind='thread'         AND state IN ('active','done','parked','abandoned'))
     )
 );
 ALTER TABLE exploration_nodes ADD COLUMN IF NOT EXISTS blocked_reason TEXT;
@@ -228,7 +229,8 @@ BEGIN
           AND conname='ck_node_state'
           AND (pg_get_constraintdef(oid) NOT LIKE '%paused%'
                OR pg_get_constraintdef(oid) NOT LIKE '%superseded%'
-               OR pg_get_constraintdef(oid) NOT LIKE '%deleted%')
+               OR pg_get_constraintdef(oid) NOT LIKE '%deleted%'
+               OR pg_get_constraintdef(oid) NOT LIKE '%thread%')
     ) THEN
         ALTER TABLE exploration_nodes DROP CONSTRAINT ck_node_state;
         ALTER TABLE exploration_nodes ADD CONSTRAINT ck_node_state CHECK (
@@ -1406,11 +1408,14 @@ CREATE INDEX IF NOT EXISTS idx_notification_deliveries_batch
 CREATE INDEX IF NOT EXISTS idx_notification_deliveries_channel
     ON notification_deliveries(channel_id, id DESC);
 
--- ★★ 本地补丁（R05-V2/V3/V4）：为 validity_audit / validity_gate / baseline / observation 开 kind 白名单。
--- 依据：schema.sql 每次启动被 Exec、须幂等，故用 DROP IF EXISTS + ADD。
+-- ★★ 本地补丁（R05-V2/V3/V4 + thread）：kind / state 白名单。
+--
+-- ⚠ 这一段是【权威定义】：schema.sql 每次启动都被 Exec，这里无条件 DROP + ADD，
+--   所以任何"新增 kind / 新增状态"都必须改这里——前面那些 DO 块做的迁移会被本段覆盖。
+--   （2026-10-17 踩过：把 thread 的迁移加在前面，启动后约束里仍然没有 thread。）
 ALTER TABLE exploration_nodes DROP CONSTRAINT IF EXISTS ck_node_kind;
 ALTER TABLE exploration_nodes ADD CONSTRAINT ck_node_kind CHECK (
-    kind IN ('begin','goal','intent','fact','finding','hint','digest','validity_audit','validity_gate','baseline','observation'));
+    kind IN ('begin','goal','intent','fact','finding','hint','digest','validity_audit','validity_gate','baseline','observation','thread'));
 
 ALTER TABLE exploration_nodes DROP CONSTRAINT IF EXISTS ck_node_state;
 ALTER TABLE exploration_nodes ADD CONSTRAINT ck_node_state CHECK (
@@ -1424,4 +1429,5 @@ ALTER TABLE exploration_nodes ADD CONSTRAINT ck_node_state CHECK (
     (kind='validity_audit' AND state IN ('confirmed','dismissed')) OR
     (kind='validity_gate'  AND state IN ('confirmed','dismissed')) OR
     (kind='baseline'       AND state IN ('confirmed','dismissed')) OR
-    (kind='observation'    AND state IN ('confirmed','dismissed')));
+    (kind='observation'    AND state IN ('confirmed','dismissed')) OR
+    (kind='thread'         AND state IN ('active','done','parked','abandoned')));

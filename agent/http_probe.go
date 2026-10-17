@@ -222,6 +222,39 @@ func jsonPath(v any, path string) (string, bool) {
 //
 //	长响应后面的内容模型永远看不到。加 offset 后可翻页取全。
 //	off 越界时返回空串 + 调用方据此判断"已经到底"。
+//
+// sanitizeForJSONB 把字符串里的非法序列清掉，供写进 jsonb 列使用。
+//
+// ★ 2026-10-17 踩过：目标返回的响应体里可能带 \u0000 或其他非法 UTF-8
+// （task45 的 /api/ping 命令注入回显就有），PostgreSQL 的 jsonb 直接拒收：
+//
+//	ERROR: unsupported Unicode escape sequence (SQLSTATE 22P05)
+//
+// 后果是【整条 observation 落盘失败】——证据丢了，而且只表现为一条 activity 错误。
+// 这里把 NUL 换成可见占位、非法 UTF-8 换成 U+FFFD，保证能落盘且不歪曲内容。
+func sanitizeForJSONB(s string) string {
+	if s == "" {
+		return s
+	}
+	// NUL 与 jsonb 不接受的其它 C0 控制符（保留 \t \n \r）
+	var b strings.Builder
+	b.Grow(len(s))
+	for _, r := range s {
+		switch {
+		case r == 0:
+			b.WriteString(`\u2400`) // ␀ 的可见表示
+		case r < 0x20 && r != '\t' && r != '\n' && r != '\r':
+			b.WriteRune('\uFFFD')
+		case r == 0xFFFE || r == 0xFFFF:
+			b.WriteRune('\uFFFD')
+		default:
+			b.WriteRune(r)
+		}
+	}
+	// range over string 已把非法 UTF-8 变成 U+FFFD，这里兜底再洗一遍
+	return strings.ToValidUTF8(b.String(), "\uFFFD")
+}
+
 func excerptAt(b []byte, off, n int) string {
 	if off < 0 {
 		off = 0
@@ -640,11 +673,43 @@ func (t *ToolSet) loadObservation(id int64) (*observationPayload, error) {
 	return &pl, nil
 }
 
+// sanitizeMap 递归清理 map 里所有字符串值（供写 jsonb 用）。
+// 落盘路径统一走 mustMap → 这里，避免每处 AddNode 都记得调。
+func sanitizeMap(m map[string]any) map[string]any {
+	for k, v := range m {
+		switch x := v.(type) {
+		case string:
+			m[k] = sanitizeForJSONB(x)
+		case map[string]any:
+			m[k] = sanitizeMap(x)
+		case []any:
+			for i, e := range x {
+				switch y := e.(type) {
+				case string:
+					x[i] = sanitizeForJSONB(y)
+				case map[string]any:
+					x[i] = sanitizeMap(y)
+				}
+			}
+		}
+	}
+	return m
+}
+
+// mustMap 把结构化 payload 转成可直接写 jsonb 的 map。
+//
+// ★ 出口统一 sanitize：目标响应体里可能带 NUL 或非法 UTF-8（命令注入回显、
+// 二进制文件片段都常见），PostgreSQL 的 jsonb 会直接拒收：
+//
+//	ERROR: unsupported Unicode escape sequence (SQLSTATE 22P05)
+//
+// 后果是整条 observation 落盘失败 —— 证据丢了，而且只表现为一条 activity 错误。
+// 这里做一次递归清理，保证"能拿到的证据一定落得下去"。
 func mustMap(v any) map[string]any {
 	b, _ := json.Marshal(v)
 	var m map[string]any
 	_ = json.Unmarshal(b, &m)
-	return m
+	return sanitizeMap(m)
 }
 
 func orDash(s string) string {

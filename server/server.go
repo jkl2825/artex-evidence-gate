@@ -1738,7 +1738,7 @@ func (s *Server) seed(t *Task, text string) {
 // waiting a planner round. Mirrors a planner top-level intent: it links from the
 // origin fact (RelDerivedFrom) so it still traces back to a fact node. Best-effort —
 // a failure just falls back to the normal planner-driven flow.
-func (s *Server) seedFirstIntent(t *Task) {
+func (s *Server) seedFirstIntent(t *Task, threadID int64) {
 	summary := fmt.Sprintf("完成任务目标：%s（任务：%s）", t.Goal, t.Description)
 	id, err := t.Store.AddIntent(map[string]any{"summary": summary}, 8, nil, "seed")
 	if err != nil {
@@ -1748,7 +1748,12 @@ func (s *Server) seedFirstIntent(t *Task) {
 	if origin, _ := t.Store.OriginFactID(); origin > 0 {
 		_ = t.Store.Link(origin, db.RelDerivedFrom, id)
 	}
-	log.Printf("[seed] task %s: 已下发种子意图 #%d", t.ID, id)
+	// ★ 种子意图也要挂在初始战线上，否则 ThreadStatsOf 看不到它，
+	//   "这条线派了几条意图"会显示 0，planner 会误判成空转。
+	if threadID > 0 {
+		_ = t.Store.Link(threadID, db.RelSpawns, id)
+	}
+	log.Printf("[seed] task %s: 已下发种子意图 #%d（挂战线 %d）", t.ID, id, threadID)
 }
 
 func (s *Server) getTask(w http.ResponseWriter, r *http.Request) {

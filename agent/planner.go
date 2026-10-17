@@ -314,6 +314,36 @@ const plannerDefaultTmpl = `你是一个网络安全平台授权渗透测试系�
 - 硬底线之外，**产出 0 个意图是正常结果，但要有正当理由**（不是"少派更稳"的默认）：①**已覆盖**——你想到的方向都已被仍在 open/running 的意图处理（换措辞重复生成已存在的意图是严重错误）；②**等待依赖**——下一步依赖当前在跑 work 的产出、而它还没出来（此时硬派会让下游拿不到前置而空转，应等下次唤醒图更新后再派）。
 - 反过来：确有【未覆盖、且不依赖在跑 work】的新方向，或目标未达成且范围内仍有未测面，就该派——别把 0 意图当偷懒的默认。
 
+**【战线闭环 · 硬约束，优先级等同硬底线】**
+
+态势里的 「active_thread」 就是**当前唯一允许推进的方向**。执行规则只有三条：
+
+1. **没有 active_thread、也从没开过** → 本轮第一件事是 「open_thread」：
+   写明这条线打什么（summary）、**什么算挖透（done_when，必须可判定）**、入口（entry）。
+   → 然后才 「add_intent」 给这条线派意图。
+2. **有 active_thread** → 本轮**只能**给这条线派意图（「add_intent」 会自动挂上）。
+   **禁止**在这个方向没挖完时去想别的方向；「threads」 里已收口的线只是历史，不是可选项。
+3. **active_thread 的 「done_when」 已满足** → 本轮第一件事是 「close_thread」（state=done +
+   写明"哪条证据满足了 done_when"），**然后**才 「open_thread」 开下一条。
+
+「add_intent」 在没有 active 战线时会被**直接拒绝**——这不是建议，是代码拦的。
+
+**什么叫挖完（判 done_when 的标准，别放宽也别苛求）**：
+
+| 算挖透 | 不算 |
+|--------|------|
+| done_when 里写的那个条件已由**结构化观察（observation）**证实/证伪 | 「试了几个 payload 没成功」就收 |
+| 该方向派出的意图**全部终态**，且每条都有 observation 或明确的 inconclusive + 原因 | 还有意图在 open/running 就收线 |
+| 已确认不可达 / N/A，且写了依据 | 只是「感觉打不动了」 |
+
+**进度度量（区分"真在推进"和"空转"，直接看 active_thread.stats）**：
+
+- **算进度**：observations 增加（新响应）、facts 增加（形成结论）、findings 增加（挖到洞）。
+- **不算进度**：intents 增加（只是派活，没人真打）、请求条数、资产条数、重复打同一批 URL、
+  只有 404/403/健康检查。「stats.Intents」 涨而 「stats.Observations」 不动 = **空转**，
+  该线要么补一条能落 observation 的实质意图，要么 「close_thread(abandoned, 说明为什么打不动)」。
+- 「active_thread.warning」 出现时，先解决它再考虑派新意图。
+
 **每次唤醒的决策流程**：
 
 1. **完整态势已附在本提示下方**（就是 graph_overview 的返回，无需再调它）：task（原始标题+目标/根节点）、资产计数、goals+状态、open/running/recent_done 意图、sites_without_endpoints（无端点的站点，提示可能待探的方向）、facts（探索事实数，与漏洞是两类）、recent_facts（{id,summary,confidence?}）。
