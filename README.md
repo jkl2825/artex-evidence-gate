@@ -117,14 +117,22 @@ build:
 
 ## 验证
 
-本仓库的改动都做过实测，结论分级按 L1/L2/L3（L3 = 端到端且有独立可观测副作用）：
+**完整验证记录见 [docs/VERIFICATION.md](docs/VERIFICATION.md)** —— 含环境、分级结论、实测原文、已知边界。
+
+摘要：
 
 ```
+L1  go build 通过 · go vet 无告警 · 本仓库改动文件 gofmt 全合规
+L2  go test ./agent/ -run TestHoneypot 全绿（11 条签名 / 3 正例 / 3 负例 / 空条件不命中）
 L3  写回门闭环：insufficient → 模型补跑对照 → sufficient → allow
+L3  蜜罐工具端到端：3 命中 / 1 不命中，worker 如实引用 verdict=hit_unverified
+── 对照基线（上游能力，非本仓库改动）──
 L3  RCE 能力考核：4/5 原语被找到并证明，0 误报，2 分 08 秒
 L3  安全靶考核：8 个"看起来有洞"的端点，0 误报，如实标注未执行项
-L2  谓词单元测试 · L3 蜜罐工具端到端（3 命中 / 1 不命中）
 ```
+
+★ **已知边界（没验证过的，别当已验证）**：只在小规模靶机（单机 / 8 端点以内）上验证；
+百端点级、内网多层、真实企业环境**没测过**。
 
 `agent/honeydetect_logic_test.go` 是可直接跑的：
 
