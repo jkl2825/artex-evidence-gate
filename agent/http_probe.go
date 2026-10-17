@@ -293,14 +293,21 @@ func (t *ToolSet) httpProbe() actool.CoreTool {
 			guard := t.loadScopeGuard()
 			sv := guard.checkURL(a.URL)
 			if blocked, verdict := guard.enforce(sv); blocked {
+				// ★ 2026-10-17：错误里必须带【真实理由】，否则模型看不到
+				//   「疑似横向扩散」还是「绝对禁止段」还是「scope 没匹配」，
+				//   只能看到一句笼统的"超出授权范围"，会盲目重试。
 				body, _ := json.MarshalIndent(map[string]any{
-					"error":         "目标超出授权范围，请求未发出",
+					"error":         "请求未发出（" + verdict.Layer + "）",
+					"reason":        verdict.Rule,
 					"scope_verdict": verdict,
 					"scope":         guard.summary(),
-					"next": "若该目标确在授权范围内：用 add_task_scope 显式加入" +
-						"（kind=ip/cidr/subdomain/root_domain，务必填 reason），或调用 " +
-						"scope_status(auto_declare=true) 从任务目标文本自动声明。" +
-						"绝对禁止段（169.254/16 云元数据、127/8 回环、组播、保留）任何情况下都不放行。",
+					"next": "若该目标确在授权范围内：" +
+						"① 内网单机/小段（≤256 地址）用 add_task_scope kind=ip 或 kind=cidr（掩码 ≥/24）显式声明 —— " +
+						"这属于「纵向」，允许；" +
+						"② 整段内网的批量授权需由部署方设置 ARTEX_INTRANET_ALLOW —— 模型无法自行打开；" +
+						"③ 绝对禁止段（169.254/16 云元数据、127/8 回环、0/8、组播、保留）任何情况下都不放行。\n" +
+						"注意：把没声明过的内网地址加进 scope 再打，属于「横向扩散」，" +
+						"需要你确认它确实在本任务授权范围内再做。",
 				}, "", "  ")
 				return actool.Errorf(string(body)), nil
 			}
