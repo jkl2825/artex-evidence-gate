@@ -1,0 +1,104 @@
+name: release
+on:
+  push:
+    tags: ["v*"]
+
+permissions:
+  contents: write # 创建 Release 需要
+
+jobs:
+  # ① 前端静态导出（一次），产物给交叉编译各平台复用
+  frontend:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-node@v4
+        with:
+          node-version: "22"
+          cache: npm
+          cache-dependency-path: web/package-lock.json
+      - run: npm ci
+        working-directory: web
+      - run: npm run build:static
+        working-directory: web
+      - uses: actions/upload-artifact@v4
+        with:
+          name: web-dist
+          path: web/out
+
+  # ② 五平台交叉编译（内嵌前端）+ 打 zip
+  binaries:
+    needs: frontend
+    runs-on: ubuntu-latest
+    strategy:
+      matrix:
+        include:
+          - { goos: linux, goarch: amd64 }
+          - { goos: linux, goarch: arm64 }
+          - { goos: darwin, goarch: amd64 }
+          - { goos: darwin, goarch: arm64 }
+          - { goos: windows, goarch: amd64 }
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-go@v5
+        with:
+          go-version: "1.26"
+          cache: true
+      - uses: actions/download-artifact@v4
+        with:
+          name: web-dist
+          path: server/webui/dist
+      - name: Build and package with build.sh
+        env:
+          ARTEX_TARGET_OS: ${{ matrix.goos }}
+          ARTEX_TARGET_ARCH: ${{ matrix.goarch }}
+          ARTEX_BUILD_VERSION: ${{ github.ref_name }}
+          ARTEX_SKIP_FRONTEND: "1"
+          ARTEX_SKIP_NPM_CI: "1"
+          # UPX 自解压 ELF 在部分 Linux 内核、虚拟化和安全策略下会崩溃。
+          # Release 使用 Go linker 裁剪和 zip 压缩，优先保证可移植性。
+          ARTEX_COMPRESS: "0"
+          ARTEX_PACKAGE: "1"
+          ARTEX_PACKAGE_DIR: dist
+        run: |
+          ./build.sh --target "${ARTEX_TARGET_OS}/${ARTEX_TARGET_ARCH}"
+      - name: Smoke test Linux amd64 binary
+        if: matrix.goos == 'linux' && matrix.goarch == 'amd64'
+        run: dist/artex-linux-amd64/artex -h
+      - uses: actions/upload-artifact@v4
+        with:
+          name: pkg-${{ matrix.goos }}-${{ matrix.goarch }}
+          path: "dist/*.zip"
+  # ③ 汇总所有 zip → 创建 GitHub Release
+  release:
+    needs: binaries
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/download-artifact@v4
+        with:
+          pattern: pkg-*
+          merge-multiple: true
+          path: dist
+      - name: Generate checksums
+        working-directory: dist
+        run: sha256sum *.zip > SHA256SUMS
+      - uses: softprops/action-gh-release@v2
+        with:
+          files: |
+            dist/*.zip
+            dist/SHA256SUMS
+          generate_release_notes: true
+
+  # ④ 校验正式 Release 产物 → 双架构实际运行 → 推 Docker Hub。
+  # 手工补发旧版本可单独运行 docker-release 工作流，不重发二进制或移动 tag。
+  docker:
+    needs: release
+    # Derivative repositories publish binaries without pushing the upstream image.
+    # Set DOCKERHUB_IMAGE explicitly to opt in with a repository-owned image name.
+    if: github.repository == 'Autumn-27/ARTEX' || vars.DOCKERHUB_IMAGE != ''
+    uses: ./.github/workflows/docker-release.yml
+    with:
+      tag: ${{ github.ref_name }}
+    secrets:
+      DOCKERHUB_USERNAME: ${{ secrets.DOCKERHUB_USERNAME }}
+      DOCKERHUB_TOKEN: ${{ secrets.DOCKERHUB_TOKEN }}

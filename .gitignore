@@ -1,0 +1,53 @@
+# ── 运行时数据与密钥（绝不入库）──
+.env
+.env.*
+!.env.example
+data/
+jwt.key
+config.json
+*.db
+*.db-shm
+*.db-wal
+*.sqlite
+*.sqlite3
+transcripts/
+*.pem
+*.key
+*.p12
+id_rsa*
+.git-credentials
+
+# ── 第三方闭源依赖（自行恢复，见 README）──
+/norma/
+
+# ── 构建产物 ──
+/artex
+/artex.exe
+/out/
+dist/
+server/webui/dist/
+
+# ── 工具链资产（体积大，不上传）──
+toolchain/
+toolchain-extra/
+*.tar.gz
+
+# ── 依赖与缓存 ──
+node_modules/
+web/.next
+web/out
+__pycache__/
+*.pyc
+.venv/
+
+# ── 编辑器/系统 ──
+.DS_Store
+Thumbs.db
+.idea/
+.vscode/
+*.swp
+
+# ── 本地备份 ──
+*.before-*
+*.bak
+*.bak-*

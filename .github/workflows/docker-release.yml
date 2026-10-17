@@ -1,0 +1,198 @@
+name: docker-release
+run-name: Docker ${{ inputs.tag }}
+
+on:
+  workflow_dispatch:
+    inputs:
+      tag:
+        description: "已发布的 Release 标签，例如 v0.3.16"
+        required: true
+        type: string
+  workflow_call:
+    inputs:
+      tag:
+        required: true
+        type: string
+    secrets:
+      DOCKERHUB_USERNAME:
+        required: true
+      DOCKERHUB_TOKEN:
+        required: true
+
+permissions:
+  contents: read
+
+concurrency:
+  group: docker-release-${{ inputs.tag }}
+  cancel-in-progress: false
+
+jobs:
+  prepare:
+    runs-on: ubuntu-latest
+    outputs:
+      tag: ${{ steps.release.outputs.tag }}
+      version: ${{ steps.release.outputs.version }}
+      revision: ${{ steps.release.outputs.revision }}
+      image: ${{ steps.release.outputs.image }}
+    steps:
+      - name: Validate the published release and destination
+        id: release
+        env:
+          GH_TOKEN: ${{ github.token }}
+          RELEASE_TAG: ${{ inputs.tag }}
+          DOCKERHUB_IMAGE: ${{ vars.DOCKERHUB_IMAGE }}
+        shell: bash
+        run: |
+          set -euo pipefail
+          [[ "$RELEASE_TAG" =~ ^v[0-9]+\.[0-9]+\.[0-9]+(-[a-zA-Z0-9][a-zA-Z0-9.-]*)?$ ]] || {
+            echo 'Expected a version tag such as v0.3.16' >&2; exit 1;
+          }
+          image="$DOCKERHUB_IMAGE"
+          if [[ -z "$image" && "$GITHUB_REPOSITORY" == 'Autumn-27/ARTEX' ]]; then
+            image=autumn27/artex
+          fi
+          [[ "$image" =~ ^[a-z0-9][a-z0-9_-]*/[a-z0-9][a-z0-9._-]*$ ]] || {
+            echo 'Set DOCKERHUB_IMAGE to an explicitly owned namespace/image' >&2; exit 1;
+          }
+          gh api "repos/$GITHUB_REPOSITORY/releases/tags/$RELEASE_TAG" > release.json
+          jq -e --arg tag "$RELEASE_TAG" '.tag_name == $tag and .draft == false' release.json
+          revision="$(gh api "repos/$GITHUB_REPOSITORY/commits/$RELEASE_TAG" --jq .sha)"
+          [[ "$revision" =~ ^[a-f0-9]{40}$ ]]
+          printf 'tag=%s\nversion=%s\nrevision=%s\nimage=%s\n' \
+            "$RELEASE_TAG" "${RELEASE_TAG#v}" "$revision" "$image" >> "$GITHUB_OUTPUT"
+
+  build:
+    needs: prepare
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - { arch: amd64, runner: ubuntu-latest }
+          - { arch: arm64, runner: ubuntu-24.04-arm }
+    runs-on: ${{ matrix.runner }}
+    timeout-minutes: 45
+    env:
+      RELEASE_TAG: ${{ needs.prepare.outputs.tag }}
+      VERSION: ${{ needs.prepare.outputs.version }}
+      ARCH: ${{ matrix.arch }}
+      IMAGE: ${{ needs.prepare.outputs.image }}
+    steps:
+      # Packaging code comes from this workflow's ref; application files come only
+      # from the checksummed Release, including when backfilling an older version.
+      - uses: actions/checkout@v4
+        with:
+          persist-credentials: false
+      - name: Download and verify the exact Release binary
+        env:
+          GH_TOKEN: ${{ github.token }}
+        shell: bash
+        run: |
+          set -euo pipefail
+          package="artex-$VERSION-linux-$ARCH"
+          mkdir -p "$RUNNER_TEMP/release" "$RUNNER_TEMP/image/dist/$ARCH"
+          cd "$RUNNER_TEMP/release"
+          gh release download "$RELEASE_TAG" --repo "$GITHUB_REPOSITORY" \
+            --pattern "$package.zip" --pattern SHA256SUMS
+          # Require a checksum for this exact archive; do not accept an empty match.
+          awk -v file="$package.zip" '$2 == file { print }' SHA256SUMS > selected.sha256
+          test "$(wc -l < selected.sha256)" -eq 1
+          sha256sum --check selected.sha256
+          unzip -q "$package.zip"
+          cp "$package/artex" "$RUNNER_TEMP/image/dist/$ARCH/artex"
+          cp "$package/start.sh" "$RUNNER_TEMP/image/start.sh"
+          cp -R "$package/skills" "$RUNNER_TEMP/image/skills"
+      - uses: docker/setup-buildx-action@v3
+      - name: Build on the native architecture
+        uses: docker/build-push-action@v6
+        with:
+          context: ${{ runner.temp }}/image
+          file: Dockerfile
+          platforms: linux/${{ matrix.arch }}
+          load: true
+          # The tested local Docker image is pushed afterwards; the Docker
+          # exporter cannot retain OCI attestations in the classic image store.
+          provenance: false
+          sbom: false
+          tags: ${{ env.IMAGE }}:${{ env.RELEASE_TAG }}-${{ matrix.arch }}
+          build-args: |
+            ARTEX_BINARY_SOURCE=prebuilt
+            NPM_REGISTRY=https://registry.npmjs.org
+          labels: |
+            org.opencontainers.image.source=https://github.com/${{ github.repository }}
+            org.opencontainers.image.revision=${{ needs.prepare.outputs.revision }}
+            org.opencontainers.image.version=${{ env.VERSION }}
+            org.opencontainers.image.url=https://github.com/${{ github.repository }}/releases/tag/${{ env.RELEASE_TAG }}
+          cache-from: type=gha,scope=artex-runtime-${{ matrix.arch }}
+          cache-to: type=gha,mode=max,scope=artex-runtime-${{ matrix.arch }}
+      - name: Verify the packaged binary is identical to the Release
+        shell: bash
+        run: |
+          set -euo pipefail
+          expected="$(sha256sum "$RUNNER_TEMP/image/dist/$ARCH/artex" | cut -d ' ' -f 1)"
+          actual="$(docker run --rm --entrypoint sha256sum "$IMAGE:$RELEASE_TAG-$ARCH" /app/artex | cut -d ' ' -f 1)"
+          test "$expected" = "$actual"
+      - name: Run database, API, UI, browser and shutdown checks
+        run: python3 scripts/smoke-docker.py "$IMAGE:$RELEASE_TAG-$ARCH" "$VERSION" --platform "linux/$ARCH"
+      - name: Login only after local image validation
+        uses: docker/login-action@v3
+        with:
+          username: ${{ secrets.DOCKERHUB_USERNAME }}
+          password: ${{ secrets.DOCKERHUB_TOKEN }}
+      - name: Push the tested architecture image
+        shell: bash
+        run: |
+          set -euo pipefail
+          docker push "$IMAGE:$RELEASE_TAG-$ARCH"
+          ref="$(docker image inspect "$IMAGE:$RELEASE_TAG-$ARCH" --format '{{index .RepoDigests 0}}')"
+          digest="${ref##*@}"
+          [[ "$digest" =~ ^sha256:[a-f0-9]{64}$ ]]
+          mkdir -p "$RUNNER_TEMP/digests"
+          printf '%s\n' "$IMAGE@$digest" > "$RUNNER_TEMP/digests/$ARCH"
+      - uses: actions/upload-artifact@v4
+        with:
+          name: docker-digest-${{ matrix.arch }}
+          path: ${{ runner.temp }}/digests/${{ matrix.arch }}
+
+  publish:
+    needs: [prepare, build]
+    runs-on: ubuntu-latest
+    # Serialize manifest changes; a failed architecture can never move latest.
+    concurrency:
+      group: docker-manifest
+      cancel-in-progress: false
+    env:
+      IMAGE: ${{ needs.prepare.outputs.image }}
+      RELEASE_TAG: ${{ needs.prepare.outputs.tag }}
+    steps:
+      - uses: actions/download-artifact@v4
+        with:
+          pattern: docker-digest-*
+          merge-multiple: true
+          path: digests
+      - uses: docker/setup-buildx-action@v3
+      - uses: docker/login-action@v3
+        with:
+          username: ${{ secrets.DOCKERHUB_USERNAME }}
+          password: ${{ secrets.DOCKERHUB_TOKEN }}
+      - name: Publish and verify both architectures
+        shell: bash
+        run: |
+          set -euo pipefail
+          docker buildx imagetools create --tag "$IMAGE:$RELEASE_TAG" \
+            "$(cat digests/amd64)" "$(cat digests/arm64)"
+          docker buildx imagetools inspect "$IMAGE:$RELEASE_TAG" --raw > manifest.json
+          jq -e '[.manifests[].platform | .os + "/" + .architecture] | sort == ["linux/amd64", "linux/arm64"]' manifest.json
+      - name: Promote only the current stable Release to latest
+        env:
+          GH_TOKEN: ${{ github.token }}
+        shell: bash
+        run: |
+          set -euo pipefail
+          current="$(gh api "repos/$GITHUB_REPOSITORY/releases/latest" --jq .tag_name)"
+          if [[ "$RELEASE_TAG" == "$current" && "$RELEASE_TAG" =~ ^v[0-9]+\.[0-9]+\.[0-9]+$ ]]; then
+            docker buildx imagetools create --tag "$IMAGE:latest" "$IMAGE:$RELEASE_TAG"
+            docker buildx imagetools inspect "$IMAGE:latest" --raw > latest.json
+            cmp manifest.json latest.json
+          else
+            echo 'Version published; latest preserved because this is not the current stable Release.'
+          fi
