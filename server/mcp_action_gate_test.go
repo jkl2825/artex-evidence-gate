@@ -126,3 +126,37 @@ func TestBareToolName(t *testing.T) {
 	}
 	t.Logf("✓ 剥前缀 %d 例通过", len(cases))
 }
+
+// src_elite_mcp 的 open_world / high_risk 工具必须默认拦下。
+//
+// 背景：该 MCP 的 probe_baseline / run_checks / verify_poc 是 open_world=true，
+// 会真发包；而 V6/V7 只挂在 http_probe 上，MCP 这条路覆盖不到。
+// 不把它们列进黑名单，接 MCP 就等于在授权边界上开洞。
+func TestMCPActionGateSrcElite(t *testing.T) {
+	gate := mcpActionGate()
+	blocked := []string{"probe_baseline", "run_checks", "verify_poc", "plan_high_risk"}
+	for _, name := range blocked {
+		if gate("src_elite_mcp", name) {
+			t.Errorf("src_elite_mcp.%s 应被默认拦下，实际放行", name)
+		}
+	}
+
+	// read_only 的必须放行，否则接进来没意义
+	allowed := []string{
+		"src_profile", "scope_check", "vector_search", "skill_fetch",
+		"lookup_skill", "ai_src_plan", "hitrate_rank",
+		"js_crypto_recon", "unreachable_triage",
+		"header_trust_recon", "method_smuggling_matrix",
+	}
+	for _, name := range allowed {
+		if !gate("src_elite_mcp", name) {
+			t.Errorf("src_elite_mcp.%s 是只读工具，应放行，实际被拦", name)
+		}
+	}
+
+	// 带 mcp__ 前缀的全名也要认（walk 那条路的命名）
+	if gate("x", "mcp__src_elite_mcp__probe_baseline") {
+		t.Error("全名形式 mcp__src_elite_mcp__probe_baseline 也应被拦")
+	}
+	t.Logf("✓ %d 个动作类被拦 · %d 个只读放行", len(blocked), len(allowed))
+}

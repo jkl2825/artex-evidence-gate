@@ -49,6 +49,21 @@ var mcpActionTools = map[string]map[string]bool{
 		"create_scan_template": true, // 建扫描模板
 		"add_asset_tag":        true, // 写资产标签（改状态）
 	},
+
+	// src_elite_mcp：渗透知识库 MCP（2026-10-17 接入，见 HANDOFF 四十七节）。
+	//
+	// ★ 为什么要在这里列：该 server 的 15 个工具里，下面 4 个会产生真实网络行为
+	//   （open_world=true）或属高危动作。而 V6（授权范围闸）/ V7（测试规则闸）
+	//   只挂在 agent/http_probe.go 这一个执行器上 —— MCP 这条路上它们覆盖不到。
+	//   ⇒ 不列进来，接 MCP 就等于在授权边界上开了个洞。
+	//
+	// ⚠ 改 server 名（配置里的 name）必须同步这里，否则黑名单静默失效。
+	"src_elite_mcp": {
+		"probe_baseline": true, // open_world=true：发请求取软 404 基线与 WAF 指纹
+		"run_checks":     true, // open_world=true：unauth/cors/sensitive/redirect 检测器
+		"verify_poc":     true, // open_world=true：PoC 验证，真发包
+		"plan_high_risk": true, // risk=high_risk：高危动作审批节点（本就会被 require_approval 拦）
+	},
 }
 
 // bareToolName 把 mcp__<server>__<tool> 剥成 (server, tool)。
