@@ -842,9 +842,10 @@ func (t *ToolSet) recordObservation() actool.CoreTool {
 			if err != nil {
 				return actool.Errorf(fmt.Sprintf("观察落盘失败：%v", err)), nil
 			}
-			if intentID > 0 {
-				_ = t.ts.Link(pid(a.IntentID), db.RelYields, id)
-			}
+			// ★ 与 http_probe 同修：模型漏传 intent_id 时用本 worker 的当前意图兜底，
+			//   否则 observation 变成孤立节点（图上无父边），而孤立节点受 groupBlocks
+			//   的 K=2 最小块约束影响永远不会被折叠 ⇒ 只增不减。
+			linkObservation(t.ts, t.ownerNode, intentID, id)
 			out, _ := json.MarshalIndent(map[string]any{
 				"observation_id": id,
 				"channel":        ch,

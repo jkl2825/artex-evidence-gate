@@ -232,6 +232,29 @@ func jsonPath(v any, path string) (string, bool) {
 //
 // 后果是【整条 observation 落盘失败】——证据丢了，而且只表现为一条 activity 错误。
 // 这里把 NUL 换成可见占位、非法 UTF-8 换成 U+FFFD，保证能落盘且不歪曲内容。
+// linkObservation 把一条 observation 挂到产生它的意图下（intent --yields--> observation）。
+//
+// ★ 2026-10-17 修：http_probe 的 intent_id 不是 required，模型漏传时 pid() 返回 0，
+// Link(0,...) 建不出边（DB 里没有 src_id=0 的边）⇒ observation 变成图上的孤岛。
+// 实测 task49：154 条 observation 里 39 条没有父边，而孤立节点因 groupBlocks 的
+// K=2 最小块约束永远不会被折叠 ⇒ 只增不减。
+//
+// 兜底顺序：模型显式给的 intent_id → 本 worker 当前认领的意图（ownerNode）→ 都不建。
+// 后者是可靠的：worker 一定在某条 intent 下跑（与 report_finding 的 notifyFinding 同一套兜底）。
+func linkObservation(ts *db.ExplorationStore, ownerNode, fromArg, obsID int64) {
+	if ts == nil || obsID <= 0 {
+		return
+	}
+	iid := fromArg
+	if iid <= 0 {
+		iid = ownerNode
+	}
+	if iid <= 0 {
+		return // 没有归属就不建边，避免脏边
+	}
+	_ = ts.Link(iid, db.RelYields, obsID)
+}
+
 func sanitizeForJSONB(s string) string {
 	if s == "" {
 		return s
@@ -526,7 +549,7 @@ func (t *ToolSet) httpProbe() actool.CoreTool {
 				if werr != nil {
 					return actool.Errorf(fmt.Sprintf("请求失败且观察落盘失败：%v / %v", err, werr)), nil
 				}
-				_ = t.ts.Link(pid(a.IntentID), db.RelYields, id)
+				linkObservation(t.ts, t.ownerNode, pid(a.IntentID), id)
 				return jsonResult(map[string]any{
 					"observation_id": id, "ok": false, "error": err.Error(),
 					"transport": "failed",
@@ -617,7 +640,7 @@ func (t *ToolSet) httpProbe() actool.CoreTool {
 				return actool.Errorf(fmt.Sprintf("观察落盘失败：%v", err)), nil
 			}
 			pl.ObsRef = strconv.FormatInt(id, 10) // 引用即节点 id（不回填空，避免额外写库）
-			_ = t.ts.Link(pid(a.IntentID), db.RelYields, id)
+			linkObservation(t.ts, t.ownerNode, pid(a.IntentID), id)
 
 			out := map[string]any{
 				"observation_id": id,
