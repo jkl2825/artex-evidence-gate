@@ -159,7 +159,49 @@ observation 是在请求**之后**才写的，被拦的两次请求根本没有�
    会留下孤儿节点。
 ```
 
-### 3.8 上游能力的实测基线（用于对照，非本仓库改动）
+### 3.8 ★ V7 —— 四条通用测试规则（L2 + L3）
+
+**L2**：`go test ./agent/ -run 'TestPolicy|TestScope'` **14 个用例一起跑全绿**（0.31s）——
+
+```
+规则⑤ 写方法闸        GET/HEAD/OPTIONS 放行；POST/PUT/DELETE/PATCH 拒；
+                      ARTEX_POLICY_ALLOW_WRITE=1 后放行
+规则② 读取配额        同接口前 5 组放行、第 6 组拒（read_quota）；
+                      重复读不扣配额；不同接口独立计数；匿名请求不计
+规则⑥ 速率/总量       分钟窗口 3 发后拒（rate）；总量 3 发后拒（total）
+规则① 内网硬禁        私有网段即便显式声明进 scope 也拒（intranet_denied）；
+                      白名单内放行（intranet_allowlisted），名单外仍拒
+```
+
+★ 单测抓出了一个**真实顺序 bug**：内网检查原本排在 scope 匹配之后，
+⇒ 只要把 `10.0.0.0/8` 声明进 scope 就先命中 scope 分支而放行，规则①形同虚设。
+已改为「绝对禁止段 → 内网硬禁 → scope 匹配」，并加了 `resetIntranetAllowlistForTest`
+解决测试间全局状态串扰。
+
+**L3**：真实 agent 任务，**9 次 `http_probe` 调用 → 6 条 observation 落盘 → 3 次被拒**：
+
+| 目标 | 结果 |
+|---|---|
+| `http://10.1.2.3/` | `is_error=true`<br>`{"error":"目标超出授权范围，请求未发出"}`<br>`scope.declared=true`（已声明仍拦）· `rules:[{kind:"ip",net:"10.1.2.3/32"}]` |
+| `http://172.18.0.5:8080/api/health` | `is_error=false` · `obs#1176 status=200`（白名单内网段放行） |
+| `POST http://vulnlab:8080/api/upload` | `is_error=true`<br>`{"policy":{"rule":"write_method","detail":{"allowed_methods":["GET","HEAD","OPTIONS"],"method":"POST"}}}` |
+| `GET /api/item?id=1..5`（actor=`session:alice`） | 全部放行 → `obs#1177..#1181 status=404` |
+| `GET /api/item?id=6` | `is_error=true`<br>`{"policy":{"rule":"read_quota","detail":{"endpoint":"vulnlab\|/api/item","limit":5,"seen":["id=1","id=2","id=3","id=4","id=5"],"used":5}}}` |
+
+**计数自证**：`id=6` 没有产生 observation —— observation 在请求之后才写，被拒的请求从未发出。
+
+**已知边界**：
+```
+① 规则③（禁止披露）与④（禁止保留）不是代码能强制的，本仓库不假装解决；
+   现有的只是辅助：http_probe 的响应头脱敏（cookie/authorization/token）、
+   `scope_guard` / `policy_guard` 里不落完整敏感值。
+② 规则②的「数据组」判据是启发式：按 query 值组合或路径末段识别对象。
+   对"一次请求返回多条记录"的接口（如 /api/users 返回 100 条）无法约束 ——
+   那类需要靠规则③④的人工纪律。
+③ 规则⑥的速率闸是【保护性上限】，不是精确的 DDoS 防护；它防的是"无意跑飞"。
+```
+
+### 3.9 上游能力的实测基线（用于对照，非本仓库改动）
 
 | 能力 | 结果 |
 |---|---|

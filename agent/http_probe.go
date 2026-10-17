@@ -287,6 +287,29 @@ func (t *ToolSet) httpProbe() actool.CoreTool {
 				return actool.Errorf(string(body)), nil
 			}
 
+			// ── ★ 测试规则闸（本地新增 2026-10-17，见 policy_guard.go）──
+			// 顺序与理由：范围 → 写方法 → 读取配额 → 速率。
+			// 范围最硬（连发都不该发）；写方法次之（改数据是规则⑤的红线）；
+			// 读取配额是规则②（越权批量读取 ≤5 组）；速率是规则⑥（防 DDOS）。
+			for _, pv := range []policyVerdict{
+				t.checkMethod(method),
+				t.checkReadQuota(a.URL, a.Actor),
+				t.checkBudget(),
+			} {
+				if pv.Allowed {
+					continue
+				}
+				body, _ := json.MarshalIndent(map[string]any{
+					"error":  "违反测试规则，请求未发出",
+					"policy": pv,
+					"usage":  t.policySnapshot(),
+					"next": "这条是部署方设定的硬约束，不是建议。请调整测试方式（改用只读方法 / " +
+						"减少读取组数 / 降低频率），而不是绕过本执行器。" +
+						"确需放宽时，由部署方调整对应的 ARTEX_POLICY_* 环境变量。",
+				}, "", "  ")
+				return actool.Errorf(string(body)), nil
+			}
+
 			// ── 实际发请求 ──
 			var bodyRd io.Reader
 			if a.Body != "" {

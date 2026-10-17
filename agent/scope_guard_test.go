@@ -67,6 +67,9 @@ func (g *scopeGuard) enforceMustBlock(v scopeVerdict) bool {
 // ── 未声明范围：只走第一道闸 ────────────────────────────────────────────
 
 func TestScopeUndeclaredAllowsPublicButWarns(t *testing.T) {
+	// 清空白名单缓存，避免被其它测试的 t.Setenv 串扰（见 resetIntranetAllowlistForTest 注释）
+	t.Setenv("ARTEX_INTRANET_ALLOW", "")
+	resetIntranetAllowlistForTest()
 	g := guardWith(false)
 	v := g.checkHost("example.com")
 	if !v.Allowed {
@@ -75,17 +78,22 @@ func TestScopeUndeclaredAllowsPublicButWarns(t *testing.T) {
 	if v.Layer != "no_scope_declared" {
 		t.Errorf("层级应为 no_scope_declared，实际 %s", v.Layer)
 	}
-	// 但私有网段也应放行（因为无声明，只有绝对禁止段生效）
+	// ★ 但私有网段【不再因为"未声明"就放行】（2026-10-17 规则①改为硬禁）：
+	//   无声明只影响"公网目标是否 fail-closed"，不影响内网闸 —— 内网闸与声明无关。
 	v2 := g.checkHost("172.18.0.5")
-	if !v2.Allowed || v2.Layer != "no_scope_declared" {
-		t.Errorf("未声明范围时私有网段应放行并记警告，实际 allowed=%v layer=%s", v2.Allowed, v2.Layer)
+	if v2.Allowed {
+		t.Errorf("私有网段应被规则①硬禁（与是否声明无关），实际放行")
+	} else if v2.Layer != "intranet_denied" {
+		t.Errorf("层级应为 intranet_denied，实际 %s", v2.Layer)
 	}
-	t.Logf("✓ 未声明范围：公网与私有均放行，层级标 no_scope_declared（由上层决定是否记警告）")
+	t.Logf("✓ 未声明范围：公网放行并标 no_scope_declared；私有网段仍被规则①硬禁")
 }
 
 // ── 已声明范围：fail-closed ─────────────────────────────────────────────
 
 func TestScopeDeclaredFailClosed(t *testing.T) {
+	t.Setenv("ARTEX_INTRANET_ALLOW", "")
+	resetIntranetAllowlistForTest()
 	g := guardWith(true,
 		scopeRule{kind: "root_domain", domain: "example.com", raw: "example.com", source: "agent"},
 		scopeRule{kind: "cidr", ipnet: mustCIDR("172.18.0.0/16"), raw: "172.18.0.0/16", source: "agent"},
@@ -109,17 +117,21 @@ func TestScopeDeclaredFailClosed(t *testing.T) {
 		}
 	}
 
-	// 私有网段：在 scope 里 → 放行
-	if v := g.checkHost("172.18.0.5"); !v.Allowed {
-		t.Errorf("172.18.0.5 在 172.18.0.0/16 内，应放行，实际 %s / %s", v.Layer, v.Rule)
+	// ★ 语义变化（2026-10-17 按用户给定测试规则）：私有网段从"需在 scope 中声明"
+	//   改为"硬禁，除非落在 ARTEX_INTRANET_ALLOW 白名单"。理由：声明只能证明
+	//   "我知道我在打内网"，不能证明"被授权打内网"；规则①明确禁止内网渗透。
+	// ⇒ 因此下面两条即使【显式声明进 scope】也必须被拒。
+	if v := g.checkHost("172.18.0.5"); v.Allowed {
+		t.Errorf("172.18.0.5 属私有网段，规则①应硬禁（即使已声明进 scope），实际放行")
+	} else if v.Layer != "intranet_denied" {
+		t.Errorf("层级应为 intranet_denied，实际 %s", v.Layer)
 	}
-	// 私有网段：不在 scope 里 → 拒（private_requires_scope）
 	if v := g.checkHost("10.1.2.3"); v.Allowed {
-		t.Errorf("10.1.2.3 属私有网段且未声明，应被拒，实际允许")
-	} else if v.Layer != "private_requires_scope" {
-		t.Errorf("层级应为 private_requires_scope，实际 %s", v.Layer)
+		t.Errorf("10.1.2.3 属私有网段，规则①应硬禁，实际允许")
+	} else if v.Layer != "intranet_denied" {
+		t.Errorf("层级应为 intranet_denied，实际 %s", v.Layer)
 	}
-	t.Logf("✓ 已声明范围：子域放行、伪子域拒绝、私有网段需显式声明")
+	t.Logf("✓ 已声明范围：子域放行、伪子域拒绝、私有网段硬禁（规则①）")
 }
 
 // ── strict 模式：未声明一律拒 ───────────────────────────────────────────

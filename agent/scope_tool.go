@@ -30,7 +30,8 @@ func (t *ToolSet) scopeStatus() actool.CoreTool {
 			"任何授权都不放行（打元数据等于偷凭据，打回环等于 SSRF 打自己）。\n"+
 			"  ② 私有网段（10/8 · 172.16/12 · 192.168/16 · 100.64/10 · IPv6 ULA）默认拒绝，必须显式声明。\n"+
 			"  ③ 已声明范围外的目标：本任务若已有声明则拒绝；若尚无任何声明则放行但记警告。\n"+
-			"★ 只统计 source ∈ {manual,agent} 的声明；source=auto（系统自动累积「碰到的」主机）不构成授权。",
+			"★ 只统计 source ∈ {manual,agent} 的声明；source=auto（系统自动累积「碰到的」主机）不构成授权。\n"+
+			"★ 同时返回测试规则用量：已发请求数/上限、本分钟用量、各接口已读对象数（规则②上限 5 组）。",
 		obj(map[string]any{
 			"declare": map[string]any{
 				"type": "array",
@@ -107,6 +108,8 @@ func (t *ToolSet) scopeStatus() actool.CoreTool {
 			// ── 当前状态 ──
 			g := t.loadScopeGuard()
 			out["scope"] = g.summary()
+			// 测试规则用量（规则②读取配额 / 规则⑥速率与总量）
+			out["policy_usage"] = t.policySnapshot()
 			out["mode_env"] = "ARTEX_SCOPE_MODE（strict | declared | audit_only，默认 declared）"
 
 			if !g.declared {

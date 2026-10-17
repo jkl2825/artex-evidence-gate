@@ -87,3 +87,18 @@ CREATE 定义里加白名单 + 末尾幂等 ALTER（兼容已有库）。
 - `agent/http_probe.go`（+24）发请求前 + `CheckRedirect` 内各插一道闸
 - `agent/predicate.go`（+28）新增第 6 个谓词 `out_of_scope`（`Enforced: true`，进 `required`）
 - `agent/tools_insert.go`（+8）接线 `scopeStatus()`
+
+### V7 —— `agent/policy_guard.go`（304 行）+ `policy_guard_test.go`（178 行，新增）
+
+把四条通用测试规则落成硬判据：内网硬禁（白名单例外）· 越权读取 ≤5 组 ·
+默认只读方法 · 每分钟 + 单任务总量双闸。
+
+配置全部走环境变量，便于现场收紧而不必重建：
+`ARTEX_INTRANET_ALLOW` · `ARTEX_POLICY_MAX_READS` · `ARTEX_POLICY_ALLOW_WRITE` ·
+`ARTEX_POLICY_MAX_REQUESTS` · `ARTEX_POLICY_MAX_PER_MINUTE`
+
+修改：
+- `agent/scope_guard.go`   私有网段从"需声明"改为"硬禁除非白名单"；
+                           判定顺序改为「绝对禁止 → 内网硬禁 → scope 匹配」
+- `agent/http_probe.go`    +22 行：插三条策略闸（写方法 / 读取配额 / 速率）
+- `agent/scope_tool.go`    返回 `policy_usage` 用量快照

@@ -162,6 +162,71 @@ func ipInAny(ip net.IP, nets []*net.IPNet) (*net.IPNet, bool) {
 	return nil, false
 }
 
+// ── 内网白名单（测试规则①：禁止内网渗透）────────────────────────────────
+//
+// 语义变化（2026-10-17 按用户给定规则调整）：
+//   旧：私有网段"需在 scope 中显式声明"才允许 —— 但"声明"只能证明"我知道我在打内网"，
+//       不能证明"被授权打内网"。规则明确禁止内网渗透，所以改成【默认硬禁】。
+//   新：私有网段一律拒绝，只有落在 ARTEX_INTRANET_ALLOW 列出的 CIDR 里才放行。
+//       该白名单由部署方设置（例如本地靶机所在的 Docker 网段），模型无法自行打开。
+
+var (
+	intranetAllowOnce sync.Once
+	intranetAllowList []*net.IPNet
+)
+
+// intranetAllowlist 解析 ARTEX_INTRANET_ALLOW（逗号分隔 CIDR 或裸 IP）。
+func intranetAllowlist() []*net.IPNet {
+	intranetAllowOnce.Do(func() {
+		raw := strings.TrimSpace(os.Getenv("ARTEX_INTRANET_ALLOW"))
+		if raw == "" {
+			return
+		}
+		for _, item := range strings.Split(raw, ",") {
+			c := strings.TrimSpace(item)
+			if c == "" {
+				continue
+			}
+			if !strings.Contains(c, "/") {
+				if ip := net.ParseIP(c); ip != nil {
+					bits := 32
+					if ip.To4() == nil {
+						bits = 128
+					}
+					c = fmt.Sprintf("%s/%d", ip.String(), bits)
+				}
+			}
+			if _, n, err := net.ParseCIDR(c); err == nil {
+				intranetAllowList = append(intranetAllowList, n)
+			}
+		}
+	})
+	return intranetAllowList
+}
+
+// resetIntranetAllowlistForTest 清空已解析的白名单缓存，供测试隔离用。
+//
+// 为什么需要：intranetAllowOnce / intranetAllowList 是包级全局，而 t.Setenv 只恢复
+// 环境变量、不会重置已解析的切片。不重置就会出现"前面的测试设了白名单，
+// 后面的测试莫名被放行"的串扰（实测踩过）。
+func resetIntranetAllowlistForTest() {
+	intranetAllowOnce = sync.Once{}
+	intranetAllowList = nil
+}
+
+// intranetAllowed 判某私有地址是否落在白名单里。
+func intranetAllowed(ip net.IP) (*net.IPNet, bool) {
+	if ip == nil {
+		return nil, false
+	}
+	for _, n := range intranetAllowlist() {
+		if n.Contains(ip) {
+			return n, true
+		}
+	}
+	return nil, false
+}
+
 // ── host 归一化 ───────────────────────────────────────────────────────────
 
 // scopeNormHost 把 host / host:port / [v6]:port 归一化为小写去尾点的裸 host。
@@ -447,16 +512,17 @@ func (g *scopeGuard) checkHost(host string) scopeVerdict {
 							return v
 						}
 					}
-					// 私有但未声明
-					if g.declared {
-						v.Layer = "private_requires_scope"
-						v.Rule = fmt.Sprintf("%s 解析到私有地址 %s，未在 scope 中声明；"+
-							"如需测试请用 add_task_scope 显式加入（kind=ip 或 cidr）", host, v.ResolvedIP)
+					// ★ 规则①：解析到私有地址 → 内网硬禁（白名单例外）
+					if allowNet, ok := intranetAllowed(rip); ok {
+						v.Allowed = true
+						v.Layer = "intranet_allowlisted"
+						v.Rule = fmt.Sprintf("%s 解析到 %s，属内网白名单 %s",
+							host, v.ResolvedIP, allowNet.String())
 						return v
 					}
-					v.Allowed = true
-					v.Layer = "no_scope_declared"
-					v.Rule = fmt.Sprintf("%s 解析到私有地址 %s，本任务【未声明范围】，仅绝对禁止段生效", host, v.ResolvedIP)
+					v.Layer = "intranet_denied"
+					v.Rule = fmt.Sprintf("测试规则①「禁止进行内网渗透行为」：%s 解析到私有地址 %s。"+
+						"内网目标默认禁止；需由部署方把该网段加入 ARTEX_INTRANET_ALLOW", host, v.ResolvedIP)
 					return v
 				}
 				// 公网 IP 但域名没在 scope 里
@@ -480,7 +546,29 @@ func (g *scopeGuard) checkHost(host string) scopeVerdict {
 		return v
 	}
 
-	// IP 字面量：先看是否命中 ip/cidr 规则
+	// ★★★ 顺序说明（2026-10-17 修正）：
+	//   绝对禁止段 → 【内网硬禁】 → scope 匹配。
+	//   内网检查必须排在 scope 匹配【之前】：否则只要把 10.0.0.0/8 声明进 scope，
+	//   就会先命中 scope 分支而放行 —— "规则①禁止内网渗透" 就形同虚设。
+	//   这条是单测 TestPolicyIntranetDenied 抓出来的真实顺序 bug。
+
+	// ★ 规则①：内网硬禁。私有网段一律拒绝，只有 ARTEX_INTRANET_ALLOW 白名单里的段放行。
+	if n, hit := ipInAny(ip, privateNets); hit {
+		if allowNet, ok := intranetAllowed(ip); ok {
+			v.Allowed = true
+			v.Layer = "intranet_allowlisted"
+			v.Rule = fmt.Sprintf("%s 属私有网段 %s，但落在内网白名单 %s 内（ARTEX_INTRANET_ALLOW）",
+				host, n.String(), allowNet.String())
+			return v
+		}
+		v.Layer = "intranet_denied"
+		v.Rule = fmt.Sprintf("测试规则①「禁止进行内网渗透行为」：%s 属私有网段 %s。"+
+			"内网目标默认禁止；若这是获授权的内网测试环境，需由部署方把该网段加入 "+
+			"ARTEX_INTRANET_ALLOW（模型无法自行打开）", host, n.String())
+		return v
+	}
+
+	// 内网白名单放行后，再看是否命中其它 scope 规则（公网目标走这里）
 	for _, r := range g.rules {
 		if r.ipnet != nil && r.ipnet.Contains(ip) {
 			v.Allowed = true
@@ -488,19 +576,6 @@ func (g *scopeGuard) checkHost(host string) scopeVerdict {
 			v.Rule = fmt.Sprintf("%s=%s（source=%s）", r.kind, r.raw, r.source)
 			return v
 		}
-	}
-	// 私有网段但没声明
-	if n, hit := ipInAny(ip, privateNets); hit {
-		if g.declared {
-			v.Layer = "private_requires_scope"
-			v.Rule = fmt.Sprintf("%s 属私有网段 %s，未在 scope 中声明；"+
-				"如需测试请用 add_task_scope 加入（kind=ip 或 cidr）", host, n.String())
-			return v
-		}
-		v.Allowed = true
-		v.Layer = "no_scope_declared"
-		v.Rule = fmt.Sprintf("%s 属私有网段 %s，本任务【未声明范围】，仅绝对禁止段生效", host, n.String())
-		return v
 	}
 	// 公网 IP 未匹配
 	if g.declared {
