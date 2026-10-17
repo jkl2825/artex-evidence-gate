@@ -736,6 +736,32 @@ WHERE exploration_id=$1 AND kind=$2 ORDER BY id DESC LIMIT $3`, s.expID, kind, l
 	return scanNodes(rows)
 }
 
+// ListByKindForIntent 只取某 intent 的节点（在 SQL 里按 payload.intent_id 过滤）。
+//
+// ★ E3 修正（2026-10-17）：latestValidityAudit 原来用 ListByKind(kind, 300) 取
+//
+//	全局最新 300 条再内存过滤 intent。同一次 exploration 里若其它 intent 写了
+//	300 条审计，本 intent 那条就"消失"⇒ 写回门报"没有 sufficient 审计"
+//	⇒ 模型被迫重做审计，在并行任务里反复触发。
+//	SQL 层过滤后，窗口只受"该 intent 自己的审计条数"影响。
+//
+// intent_id 在 payload 里是 JSON 数字；用正则先挡掉非数字/缺失，避免 cast 报错。
+func (s *ExplorationStore) ListByKindForIntent(kind string, intentID int64, limit int) ([]*Node, error) {
+	if limit <= 0 {
+		limit = 100
+	}
+	rows, err := s.db.Query(`SELECT `+nodeCols+` FROM exploration_nodes
+WHERE exploration_id=$1 AND kind=$2
+  AND CASE WHEN payload->>'intent_id' ~ '^[0-9]+$'
+           THEN (payload->>'intent_id')::bigint END = $3
+ORDER BY id DESC LIMIT $4`, s.expID, kind, intentID, limit)
+	if err != nil {
+		return nil, err
+	}
+	defer rows.Close()
+	return scanNodes(rows)
+}
+
 // ListByKindPage returns one newest-first page of nodes of a kind for reverse
 // pagination: up to `limit` nodes with id < `before` (before<=0 = the newest page).
 // hasMore reports whether still-older nodes exist, so a client (e.g. the worker

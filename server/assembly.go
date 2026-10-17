@@ -7,6 +7,7 @@ import (
 	"log"
 	"path/filepath"
 	"strings"
+	"time"
 
 	"github.com/Autumn-27/artex/agent"
 	"github.com/Autumn-27/artex/db"
@@ -89,9 +90,17 @@ func wireAgentAugment(pg *db.DB, skillDir string, hostTools func() ([]actool.Cor
 					continue
 				}
 				closers = append(closers, cl)
-				ts, err := cl.Tools(ctx)
+				// ★ C5（2026-10-17）：tools/list 必须有自己的超时。
+				//   原来直接用装配时的 ctx —— 一个不响应的 stdio server 会一直挂到
+				//   父 ctx 取消（而 worker 的 run 预算是在 AugmentTools 之后才开始的，
+				//   典型表现：worker 在「还没开始调 LLM」时就卡死）。
+				//   connectMCP 的 ctx 关系 client 生命周期，不能在这里 cancel，
+				//   所以只给 Tools() 包一层。
+				toolsCtx, cancelTools := context.WithTimeout(ctx, mcpToolsListTimeout)
+				ts, err := cl.Tools(toolsCtx)
+				cancelTools()
 				if err != nil {
-					log.Printf("[mcp] %s tools/list 失败: %v", m.Name, err)
+					log.Printf("[mcp] %s tools/list 失败或超时(%s): %v", m.Name, mcpToolsListTimeout, err)
 					continue
 				}
 				// ★ MCP 动作类工具闸（本地新增 2026-10-17，见 mcp_action_gate.go）：
@@ -218,6 +227,11 @@ func seedPrompts(pg *db.DB) {
 // tool-assembly time each built-in tool is filtered by its agent binding / enabled
 // flag and, if kept, wrapped so the model sees the DB-overridden description/schema
 // and缺省入参 get injected. MCP/skill/host tools have no row and pass through.
+// mcpToolsListTimeout 是单次 MCP tools/list 的超时上限。
+// 不响应的 stdio server 会一直占用装配流程，而 worker 的 run 预算
+// 是在 AugmentTools 之后才开始的 —— 没有这个超时，run 会在调 LLM 之前就卡死。
+const mcpToolsListTimeout = 20 * time.Second
+
 func wireTools(pg *db.DB, domainReg map[string]actool.CoreTool) {
 	agent.FindingTrafficBindingEnabled = func() bool { return pg.GetBool(settingAgentTrafficBinding, false) }
 	// Seed the built-in domain tools (first-insert only; DO NOTHING preserves edits).

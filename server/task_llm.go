@@ -581,6 +581,8 @@ func (s *Server) agentsForTask(t *Task) *taskAgentBundle {
 	pl.SetSteerWork(s.engine.SteerWork)
 	pl.SetProxy(s.m.ProxyAddr(), s.m.ProxyCACert())
 	pl.SetWebSearch(s.webSearchFor("planner"))
+	// ★ C6：planner 的墙钟预算跟 worker 同一套配置（agents.run_seconds）
+	pl.SetRunTimeout(time.Duration(s.agentRunSeconds("planner")) * time.Second)
 	pl.SetConstraintInject(s.constraintInjectPlanner) // 操作约束注入 planner(可配置,默认开)
 	// cold-digest §7: 冷节点后台压缩。引擎经权威解析器实际驱动的就是这套 per-task planner
 	// (agentsForTask),Compactor 必须接在这里。走任务路由的 planner provider(§4:与 agent

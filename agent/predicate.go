@@ -582,13 +582,14 @@ func (t *ToolSet) saveValidityAudit(intentID int64, out map[string]any) int64 {
 
 // latestValidityAudit 取本意图最近一次有效性审计的判定结果。
 func (t *ToolSet) latestValidityAudit(intentID int64) (map[string]any, int64, error) {
-	// ★ E3 修正（2026-10-17）：原来固定只取【全局最新 300 条】再内存里按 intent 过滤。
-	//   后果：同一次 exploration 里若其它 intent 写了 300 条审计，本 intent 那条
-	//   就"消失"了 ⇒ 写回门报"没有 sufficient 审计"，模型被迫重做一遍审计，
-	//   在并行/大批量任务里会反复触发。
-	//   现在：窗口放大到 5000，并在确实找不到时区分「超出窗口」与「确实没有」。
-	const auditScanWindow = 5000
-	nodes, err := t.ts.ListByKind(kindValidityAudit, auditScanWindow)
+	// ★ E3 修正（2026-10-17，两步）：
+	//   原实现固定只取【全局最新 300 条】再内存里按 intent 过滤 ——
+	//   同一次 exploration 里若其它 intent 写了 300 条审计，本 intent 那条就"消失"
+	//   ⇒ 写回门报"没有 sufficient 审计" ⇒ 模型被迫重做，并行任务里反复触发。
+	//   现在：SQL 层按 intent 过滤（ListByKindForIntent），窗口只受本 intent 自己的
+	//   审计条数影响；上限仍保留一个防爆值。
+	const auditScanWindow = 500
+	nodes, err := t.ts.ListByKindForIntent(kindValidityAudit, intentID, auditScanWindow)
 	if err != nil {
 		return nil, 0, err
 	}

@@ -14,6 +14,7 @@ import (
 	"github.com/Autumn-27/norma/permission"
 	actool "github.com/Autumn-27/norma/tool"
 	"github.com/Autumn-27/norma/transcript"
+	"time"
 )
 
 // Planner is the event-driven LLM planner (docs §4.3): each time the asset or
@@ -28,6 +29,7 @@ type Planner struct {
 	window            int                                    // context window in tokens (for compaction)
 	windowFn          func() int                             // optional dynamic task-chain minimum
 	maxTurns          int                                    // max agent turns per run (0 = unlimited)
+	runTimeout        time.Duration                          // 单次运行墙钟上限 (0 = 不限)；由 server 按 agents.run_seconds 注入
 	killWork          func(intentID int64) error             // engine callback to terminate a running work (nil = off)
 	steerWork         func(intentID int64, msg string) error // engine callback to steer a running work mid-run (nil = off)
 	proxyAddr         string                                 // recording proxy for WebFetch (empty = direct)
@@ -73,6 +75,14 @@ func (p *Planner) SetNoaEnabled(fn func() bool) { p.noaEnabledFn = fn }
 // SetMaxTokens wires a resolver for the per-reply output cap. nil/unset or 0 =
 // send no cap and let the endpoint decide. Read per run, like nonStreaming.
 func (p *Planner) SetMaxTokens(fn func() int) { p.maxTokensFn = fn }
+
+// SetRunTimeout 设置 planner 单次运行的墙钟上限（0 = 不限）。
+//
+// ★ C6（2026-10-17）：原来 planner 的 ownBudget 恒传 0，只有任务级 deadline 能约束它。
+//
+//	任务没设 deadline 时，一个卡住的规划轮会一直跑到父 ctx 取消 —— 期间持续烧 token。
+//	server 侧现在按 agents.run_seconds 注入（与 worker 同一套配置）。
+func (p *Planner) SetRunTimeout(run time.Duration) { p.runTimeout = run }
 
 func (p *Planner) maxTokens() int {
 	if p.maxTokensFn == nil {
@@ -395,9 +405,10 @@ func (p *Planner) Plan(ctx context.Context, taskID int64, as *db.AssetStore, ts 
 		sysBody += constraintBlock(ts) // 操作约束(若有)注入系统提示,框定探索边界
 	}
 	system, boundary := deferredSystem(sysBody, def)
-	// planner 无自身墙钟预算;有 deadline 时把 MaxDuration 夹逼到剩余,让在跑的规划轮在
-	// 任务到点时进收尾(因超时→任务超时词,因步数→per-run 词)。
-	maxDur, clamped := clampMaxDuration(tc.DeadlineUnix, 0)
+	// ★ C6：planner 现在有自己的墙钟预算（p.runTimeout，来自 agents.run_seconds）。
+	// 有任务 deadline 时，clampMaxDuration 会取两者较小值，让在跑的规划轮
+	// 在最早到点的那个限制上进收尾（因超时→对应词，因步数→per-run 词）。
+	maxDur, clamped := clampMaxDuration(tc.DeadlineUnix, p.runTimeout)
 	settle := wrapupSettlement("planner", nil)
 	if tc.DeadlineUnix > 0 {
 		settle = wrapupSettlementForTask("planner", nil, clamped)
